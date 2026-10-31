@@ -36,7 +36,7 @@
 		try {
 			const body: any = { ...s };
 			if (newKey) body.openrouter_key = newKey;
-			for (const k of ['concurrency', 'max_attempts', 'sleep_interval', 'max_sleep_interval', 'sleep_requests', 'ytdlp_check_hours', 'account_check_hours', 'ai_batch_size'])
+			for (const k of ['concurrency', 'max_parallel_jobs', 'max_attempts', 'sleep_interval', 'max_sleep_interval', 'sleep_requests', 'ytdlp_check_hours', 'account_check_hours', 'ai_batch_size'])
 				body[k] = Number(body[k]) || 0;
 			s = await put('/settings', body);
 			orig = JSON.stringify(s);
@@ -132,6 +132,11 @@
 				<label class="field">Quality<input bind:value={s.audio_quality} placeholder="0 = best VBR, or 320K" /></label>
 				<label class="field">Parallel downloads<input type="number" min="1" max="16" bind:value={s.concurrency} /></label>
 			</div>
+			<label class="field" style="max-width: 320px">
+				Playlists synced at the same time
+				<input type="number" min="1" max="16" bind:value={s.max_parallel_jobs} />
+				<span class="hint">More playlists wait in the queue. Higher values need more CPU and memory.</span>
+			</label>
 			<label class="field">
 				File name template (yt-dlp syntax)
 				<input class="mono" bind:value={s.filename_template} />

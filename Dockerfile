@@ -26,7 +26,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates tzdata curl \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates tzdata curl procps \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd -g 1000 app && useradd -u 1000 -g app -d /config -M -s /usr/sbin/nologin app
 

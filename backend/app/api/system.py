@@ -54,6 +54,15 @@ def job_log(job_id: int, tail: int = 2000):
     return "\n".join(lines[-tail:])
 
 
+@router.post("/jobs/cancel-waiting")
+def cancel_waiting():
+    n = 0
+    for j in manager.live():
+        if j.get("status") == "queued" and manager.cancel(j["id"]):
+            n += 1
+    return {"cancelled": n}
+
+
 @router.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: int):
     if not manager.cancel(job_id):
@@ -258,7 +267,7 @@ async def put_settings(body: dict):
         p = Path(values["default_folder_root"])
         if not p.is_absolute():
             raise HTTPException(400, "Default folder must be an absolute path")
-    for k in ("concurrency", "max_attempts"):
+    for k in ("concurrency", "max_attempts", "max_parallel_jobs"):
         if k in values:
             try:
                 values[k] = max(1, min(16, int(values[k])))
@@ -272,6 +281,7 @@ async def put_settings(body: dict):
             raise HTTPException(400, f"extra args: {e}")
     settings_store.set_many(values)
     await manager.slots.poke()
+    await manager.job_slots.poke()
     return settings_store.public()
 
 

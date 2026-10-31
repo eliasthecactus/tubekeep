@@ -15,6 +15,9 @@ os.environ.update(
     STATIC_DIR=str(ROOT / "static"),
 )
 
+(ROOT / "static").mkdir(parents=True, exist_ok=True)
+(ROOT / "static" / "index.html").write_text("<!doctype html><title>Tubekeep</title>")
+
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
@@ -37,6 +40,8 @@ if "--version" in a:
     print("2026.01.01"); sys.exit(0)
 url = a[a.index("--") + 1] if "--" in a else a[-1]
 if "-J" in a:
+    import time
+    time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
     if "private" in url:
         print("ERROR: [youtube:tab] PLprivate: This playlist is private", file=sys.stderr); sys.exit(1)
     if "list=WL" in url:

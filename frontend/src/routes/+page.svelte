@@ -27,7 +27,8 @@
 		}
 	}
 
-	const jobs = $derived(Object.values(live.jobs));
+	const jobs = $derived(Object.values(live.jobs).filter((j) => j.status !== 'queued'));
+	const waiting = $derived(Object.values(live.jobs).filter((j) => j.status === 'queued').length);
 	const c = $derived(d?.counts ?? {});
 	const todo = $derived((c.pending || 0) + (c.queued || 0) + (c.downloading || 0));
 </script>
@@ -59,8 +60,9 @@
 				{#each jobs as j (j.id)}
 					<JobCard job={j} />
 				{:else}
-					<div class="card empty small">Nothing running. {d.next_runs[0] ? `Next sync ${until(d.next_runs[0].next_run_at)}.` : ''}</div>
+					<div class="card empty small">{waiting ? 'Starting…' : `Nothing running. ${d.next_runs[0] ? `Next sync ${until(d.next_runs[0].next_run_at)}.` : ''}`}</div>
 				{/each}
+				{#if waiting}<a class="small muted" href="/activity">+ {waiting} waiting in the queue →</a>{/if}
 			</section>
 
 			<section>

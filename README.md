@@ -33,6 +33,7 @@ One container, SQLite, no external services needed.
 - **Status for every track**: downloaded, not done, failed (with the yt-dlp error), unavailable, missing on disk, removed from the playlist, ignored.
 - **Missing files are detected**: every sync compares the database with the disk. Deleted files are downloaded again even when they are marked as done, moved or renamed files are found again by the video id stored in their tags, and existing files in a folder are picked up instead of downloaded twice.
 - **Live activity**: progress, speed and stage per track, job history and the full log of every job.
+- **Queue**: start as many playlists as you like; a few sync at the same time (Settings → "Playlists synced at the same time"), the rest wait their turn and survive a restart.
 
 <p align="center"><img src="docs/screenshots/playlist.png" alt="Playlist with track status" width="860" /></p>
 

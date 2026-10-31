@@ -1,12 +1,13 @@
 """Tubekeep: FastAPI app, serves the API and the built SPA."""
 import asyncio
 import logging
+import mimetypes
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from . import auth, config, db, scheduler, ytdlp
 from .api import auth_routes, metadata, playlists, system, transfers
@@ -21,6 +22,9 @@ VERSION = (Path(__file__).resolve().parent / "VERSION").read_text().strip() \
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
+    # sync API handlers run in worker threads; give them room so a busy job engine can't starve the UI
+    import anyio
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 100
     auth.bootstrap_admin()
     bus.bind(asyncio.get_running_loop())
     manager.recover()
@@ -62,7 +66,7 @@ async def headers(request: Request, call_next):
 
 
 @app.get("/api/health")
-def health():
+async def health():
     return {"ok": True, "version": VERSION, "ytdlp": ytdlp.state.get("version")}
 
 
@@ -74,16 +78,33 @@ app.include_router(system.router)
 app.include_router(transfers.router)
 
 
+_static_cache: dict[str, tuple[bytes, str]] = {}
+
+
+def _static_file(path: str) -> tuple[bytes, str] | None:
+    """The built frontend is small, keep it in memory so page loads never wait for worker threads."""
+    if path in _static_cache:
+        return _static_cache[path]
+    static = Path(config.STATIC_DIR).resolve()
+    f = (static / path).resolve()
+    if not path or not f.is_file() or static not in f.parents:
+        return None
+    mime = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+    data = f.read_bytes()
+    if len(data) < 5 * 1024 * 1024:
+        _static_cache[path] = (data, mime)
+    return data, mime
+
+
 @app.get("/{path:path}", include_in_schema=False)
-def spa(path: str):
+async def spa(path: str):
     if path.startswith("api/"):
         raise HTTPException(404, "Not found")
-    static = Path(config.STATIC_DIR)
-    f = (static / path).resolve()
-    if path and f.is_file() and static.resolve() in f.parents:
+    hit = _static_file(path)
+    if hit:
         cache = "public, max-age=31536000, immutable" if "/_app/immutable/" in f"/{path}" else "no-cache"
-        return FileResponse(f, headers={"Cache-Control": cache})
-    index = static / "index.html"
-    if index.exists():
-        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+        return Response(hit[0], media_type=hit[1], headers={"Cache-Control": cache})
+    index = _static_file("index.html")
+    if index:
+        return Response(index[0], media_type="text/html", headers={"Cache-Control": "no-cache"})
     return JSONResponse({"detail": "Frontend not built"}, status_code=404)

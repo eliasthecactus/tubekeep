@@ -66,8 +66,10 @@ def list_audio(folder: str) -> list[Path]:
     return out
 
 
-def scan(folder: str, read_tags: bool = True) -> dict:
-    """Index a folder: {'by_id': {ytid: path}, 'by_name': {normstem: [path]}, 'files': [path]}."""
+def scan(folder: str, read_tags: bool = True, skip_tags: set[str] | None = None) -> dict:
+    """Index a folder: {'by_id': {ytid: path}, 'by_name': {normstem: [path]}, 'files': [path]}.
+    Tags are only read for files not in skip_tags (files that already belong to a track)."""
+    skip_tags = skip_tags or set()
     by_id: dict[str, str] = {}
     by_name: dict[str, list[str]] = {}
     files = list_audio(folder)
@@ -76,7 +78,7 @@ def scan(folder: str, read_tags: bool = True) -> dict:
         m = re.search(r"\[([\w-]{11})\]", p.stem)  # "%(title)s [%(id)s]" style templates
         if m:
             by_id.setdefault(m.group(1), str(p))
-        if read_tags:
+        if read_tags and str(p) not in skip_tags:
             try:
                 vid = tags.youtube_id(tags.read(p))
                 if vid:

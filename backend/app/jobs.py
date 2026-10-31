@@ -1,6 +1,7 @@
 """Job engine: playlist sync, downloads, file verification. Runs in the app's event loop."""
 import asyncio
 import json
+import threading
 import logging
 import os
 import time
@@ -20,17 +21,19 @@ class JobError(Exception):
 
 
 class Slots:
-    """Global download limiter; reads the concurrency setting on every acquire."""
+    """Global limiter that reads its limit from a setting on every acquire."""
 
-    def __init__(self) -> None:
+    def __init__(self, setting: str = "concurrency", default: int = 1) -> None:
+        self.setting = setting
+        self.default = default
         self.active = 0
         self.cond = asyncio.Condition()
 
     def limit(self) -> int:
         try:
-            return max(1, min(16, int(settings_store.get("concurrency") or 1)))
+            return max(1, min(16, int(settings_store.get(self.setting) or self.default)))
         except (TypeError, ValueError):
-            return 1
+            return self.default
 
     async def __aenter__(self):
         async with self.cond:
@@ -55,7 +58,9 @@ class Ctx:
         self.id = job["id"]
         self.stats: dict = db.jload(job["stats"], {}) or {}
         self.phase = "queued"
+        self.status = "queued"
         self.items: dict[int, dict] = {}
+        self._log_lock = threading.Lock()
         self._last_pub: dict[int, float] = {}
         self._fh = open(config.JOB_LOG_DIR / f"{self.id}.log", "a", encoding="utf-8")
 
@@ -67,8 +72,9 @@ class Ctx:
 
     def log(self, msg: str) -> None:
         line = time.strftime("%H:%M:%S ") + msg
-        self._fh.write(line + "\n")
-        self._fh.flush()
+        with self._log_lock:
+            self._fh.write(line + "\n")
+            self._fh.flush()
         bus.publish("log", {"job_id": self.id, "line": line})
 
     def set_phase(self, phase: str) -> None:
@@ -83,7 +89,7 @@ class Ctx:
                 "playlist_id": self.job["playlist_id"], "transfer_id": self.job.get("transfer_id"),
                 "phase": self.phase,
                 "stats": {k: v for k, v in self.stats.items() if not k.startswith("_")},
-                "items": list(self.items.values()), "status": "running"}
+                "items": list(self.items.values()), "status": self.status}
 
     def publish(self) -> None:
         db.execute("UPDATE jobs SET stats = ? WHERE id = ?",
@@ -111,7 +117,8 @@ class Manager:
         self.ctx: dict[int, Ctx] = {}
         self.locks: dict[int, asyncio.Lock] = {}
         self.global_lock = asyncio.Lock()   # verify-all etc.
-        self.slots = Slots()
+        self.slots = Slots("concurrency", 2)          # yt-dlp downloads at the same time
+        self.job_slots = Slots("max_parallel_jobs", 3)  # playlist syncs/transfers at the same time
         self.loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------ lifecycle
@@ -119,9 +126,17 @@ class Manager:
     def recover(self) -> None:
         """After a restart nothing is running: fix rows left in running states."""
         self.loop = asyncio.get_running_loop()
-        db.execute("UPDATE jobs SET status = 'failed', error = 'Interrupted by restart', finished_at = ? "
-                   "WHERE status IN ('queued', 'running')", [db.now()])
         db.execute("UPDATE items SET status = 'pending' WHERE status IN ('queued', 'downloading')")
+        # jobs that were waiting simply continue; jobs that were running start over
+        waiting = db.rows("SELECT * FROM jobs WHERE status = 'queued' ORDER BY id")
+        running = db.rows("SELECT * FROM jobs WHERE status = 'running' ORDER BY id")
+        db.execute("UPDATE jobs SET status = 'failed', error = 'Interrupted by restart, started again', "
+                   "finished_at = ? WHERE status = 'running'", [db.now()])
+        for job in waiting:
+            self._start(job)
+        for job in running:
+            self.enqueue(job["type"], job["playlist_id"], db.jload(job["params"], {}), trigger="restart",
+                         title=job["title"], transfer_id=job.get("transfer_id"))
         # keep the last 1000 job logs
         old = db.rows("SELECT id FROM jobs ORDER BY id DESC LIMIT -1 OFFSET 1000")
         for r in old:
@@ -203,7 +218,8 @@ class Manager:
         params = db.jload(job["params"], {}) or {}
         status, error = "done", None
         try:
-            async with self.lock_for(job["playlist_id"], job.get("transfer_id")):
+            async with self.job_slots, self.lock_for(job["playlist_id"], job.get("transfer_id")):
+                ctx.status = "running"
                 db.update("jobs", job["id"], {"status": "running", "started_at": db.now()})
                 ctx.set_phase("starting")
                 handler = {"sync": self._sync, "download": self._download, "verify": self._verify,
@@ -362,8 +378,8 @@ class Manager:
         if not need:
             return
         ctx.set_phase("scanning folder")
-        index = library.scan(folder)
         taken = {r["file_path"] for r in done if r["id"] not in missing_ids}
+        index = library.scan(folder, skip_tags=taken)
         adopted = 0
         for r in need:
             p = library.find_file(index, {"id": r["vid"], "title": r["title"], "channel": r["channel"],
@@ -402,11 +418,14 @@ class Manager:
         if not items:
             ctx.log("Nothing to download")
             return
-        library.check_folder(pl["folder"])
+        await asyncio.to_thread(library.check_folder, pl["folder"])
         ctx.stats["to_download"] = len(items)
         ctx.stats["_queued"] = [it["id"] for it in items]
-        for it in items:
-            set_item(it["id"], status="queued")
+
+        def mark_queued():
+            for it in items:
+                set_item(it["id"], status="queued")
+        await asyncio.to_thread(mark_queued)
         ctx.set_phase("downloading")
         ctx.log(f"Downloading {len(items)} tracks to {pl['folder']}")
         await asyncio.gather(*(self._download_one(ctx, pl, acc, it, force) for it in items))
@@ -468,7 +487,7 @@ class Manager:
                     path = res.done[-1].get("filepath")
                 if res.returncode == 0 and path and library.file_ok(path):
                     proxies.report(proxy and proxy["id"], True)
-                    await self._finalize(ctx, it, res.done[-1], path, old_path)
+                    await asyncio.to_thread(self._finalize, ctx, it, res.done[-1], path, old_path)
                     return
                 err = res.error_text or ("yt-dlp finished but no file was written" if res.returncode == 0
                                          else f"yt-dlp exited with {res.returncode}")
@@ -501,7 +520,7 @@ class Manager:
             ctx.items.pop(it["id"], None)
             ctx.publish()
 
-    async def _finalize(self, ctx: Ctx, it: dict, info: dict, path: str, old_path: str | None) -> None:
+    def _finalize(self, ctx: Ctx, it: dict, info: dict, path: str, old_path: str | None) -> None:
         db.execute(
             "UPDATE videos SET title = COALESCE(?, title), channel = COALESCE(?, channel), "
             "description = COALESCE(?, description), yt_artist = ?, yt_track = ?, yt_album = ?, "
@@ -556,20 +575,21 @@ class Manager:
         ctx.set_phase("fetching playlist")
         data = await self._enumerate(ctx, pl, acc)
         if not pl["folder"]:
-            folder = library.check_folder(library.default_folder(data.get("title") or pl["url"]))
+            folder = await asyncio.to_thread(library.check_folder,
+                                             library.default_folder(data.get("title") or pl["url"]))
             db.update("playlists", pl["id"], {"folder": folder})
             ctx.log(f"Download folder: {folder}")
-        self._upsert(ctx, pl, data)
+        await asyncio.to_thread(self._upsert, ctx, pl, data)
         pl = self._playlist(pl["id"])
         if pl["title"] and ctx.job["title"] != f"Sync {pl['title']}":
             ctx.job["title"] = f"Sync {pl['title']}"
             db.update("jobs", ctx.id, {"title": ctx.job["title"]})
         bus.publish("playlist", {"id": pl["id"]})
-        library.check_folder(pl["folder"])
+        await asyncio.to_thread(library.check_folder, pl["folder"])
         ctx.set_phase("checking files")
-        self._verify_files(ctx, pl)
-        await self._download_all(ctx, pl, acc, self._todo(pl, acc))
-        self._handle_removed(ctx, pl)
+        await asyncio.to_thread(self._verify_files, ctx, pl)
+        await self._download_all(ctx, pl, acc, await asyncio.to_thread(self._todo, pl, acc))
+        await asyncio.to_thread(self._handle_removed, ctx, pl)
         ctx.set_phase("finished")
         ctx.log("Sync finished: " + ", ".join(f"{k} {v}" for k, v in ctx.stats.items() if not k.startswith("_")))
 
@@ -605,7 +625,7 @@ class Manager:
             ctx.log(f"Checking {pl['title'] or pl['url']}")
             ctx.set_phase("checking files")
             # verify never downloads; missing files get 'pending' so the next sync fetches them
-            self._verify_files(ctx, pl)
+            await asyncio.to_thread(self._verify_files, ctx, pl)
             bus.publish("playlist", {"id": pid})
         ctx.set_phase("finished")
 

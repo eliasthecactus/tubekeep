@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { ScrollText, Trash2 } from '@lucide/svelte';
-	import { del, get, qs } from '#lib/api.ts';
+	import { del, get, post, qs } from '#lib/api.ts';
 	import { datetime, ago } from '#lib/format.ts';
-	import { errorToast, live, on } from '#lib/state.svelte.ts';
+	import { errorToast, live, on, toast } from '#lib/state.svelte.ts';
 	import JobCard from '#lib/components/JobCard.svelte';
 	import Modal from '#lib/components/Modal.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
@@ -84,19 +84,50 @@
 		if (s.removed) parts.push(`${s.removed} removed`);
 		return parts.join(' · ');
 	}
-	const running = $derived(Object.values(live.jobs));
+	const running = $derived(Object.values(live.jobs).filter((j) => j.status !== 'queued'));
+	const waiting = $derived(Object.values(live.jobs).filter((j) => j.status === 'queued').sort((a, b) => a.id - b.id));
+	async function cancelJob(id: number) {
+		await post(`/jobs/${id}/cancel`).catch(errorToast);
+	}
+	async function cancelWaiting() {
+		try {
+			const r = await post('/jobs/cancel-waiting');
+			toast(`Cancelled ${r.cancelled} waiting jobs`);
+		} catch (e) {
+			errorToast(e);
+		}
+	}
 </script>
 
 <div class="page-head"><h1>Activity</h1></div>
 
 <section style="margin-bottom: 22px">
-	<div class="section-title"><h2>Running and waiting</h2><span class="pill">{running.length}</span></div>
+	<div class="section-title"><h2>Running</h2><span class="pill">{running.length}</span></div>
 	{#each running as j (j.id)}
 		<JobCard job={j} onlog={openLog} />
 	{:else}
 		<div class="card empty small">No jobs running</div>
 	{/each}
 </section>
+
+{#if waiting.length}
+	<section style="margin-bottom: 22px">
+		<div class="section-title">
+			<h2>Waiting</h2><span class="pill">{waiting.length}</span>
+			<span class="spacer"></span>
+			<button class="sm" onclick={cancelWaiting}>Cancel all waiting</button>
+		</div>
+		<div class="card waitlist">
+			{#each waiting as j, i (j.id)}
+				<div class="wrow">
+					<span class="faint small">{i + 1}</span>
+					<span class="grow ellipsis">{j.title}</span>
+					<button class="ghost sm" onclick={() => cancelJob(j.id)}>Cancel</button>
+				</div>
+			{/each}
+		</div>
+	</section>
+{/if}
 
 <section>
 	<div class="section-title">
@@ -168,6 +199,20 @@
 	}
 	.errtext {
 		color: var(--err);
+	}
+	.waitlist {
+		max-height: 340px;
+		overflow: auto;
+	}
+	.wrow {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 4px 6px 4px 14px;
+		border-bottom: 1px solid var(--line);
+	}
+	.wrow:last-child {
+		border-bottom: none;
 	}
 	@media (max-width: 720px) {
 		.hide-sm {

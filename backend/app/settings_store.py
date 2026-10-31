@@ -14,6 +14,7 @@ DEFAULTS: dict[str, Any] = {
     "sponsorblock_music_offtopic": False,
     "extra_args": "",
     "concurrency": 2,
+    "max_parallel_jobs": 3,         # playlist syncs / transfers running at the same time
     "max_attempts": 3,
     "sleep_interval": 0,            # seconds between downloads (min)
     "max_sleep_interval": 0,

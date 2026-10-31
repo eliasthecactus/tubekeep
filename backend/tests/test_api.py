@@ -165,3 +165,34 @@ def test_delete_playlist_with_files(client):
     client.delete(f"/api/playlists/{pl['id']}?delete_files=true", headers=H)
     assert not f.exists()
     assert all(p["id"] != pl["id"] for p in client.get("/api/playlists").json())
+
+
+def test_many_playlists_are_queued_and_ui_stays_responsive(client, fake_yt):
+    """Starting a lot of playlists at once must not run them all in parallel or block the web server."""
+    client.put("/api/settings", json={"max_parallel_jobs": 2}, headers=H)
+    set_playlist(fake_yt, "Bulk", entries("eeeeeeeeeee"))
+    os.environ["FAKE_SLEEP"] = "0.4"
+    try:
+        urls = [f"https://www.youtube.com/playlist?list=PLbulk{i}" for i in range(12)]
+        r = client.post("/api/playlists", json={"urls": urls}, headers=H)
+        assert len(r.json()["created"]) == 12
+        peak, slowest = 0, 0.0
+        end = time.time() + 60
+        while time.time() < end:
+            t0 = time.time()
+            live = client.get("/api/jobs/live").json()
+            assert client.get("/").status_code == 200
+            slowest = max(slowest, time.time() - t0)
+            running = [j for j in live if j["status"] == "running"]
+            peak = max(peak, len(running))
+            if not live:
+                break
+            time.sleep(0.05)
+        assert not client.get("/api/jobs/live").json(), "jobs did not finish"
+        assert peak <= 2, f"{peak} jobs ran at the same time"
+        assert slowest < 1.0, f"UI requests took {slowest:.2f}s"
+        jobs = client.get("/api/jobs?limit=12&type=sync").json()["jobs"]
+        assert all(j["status"] == "done" for j in jobs)
+    finally:
+        os.environ.pop("FAKE_SLEEP", None)
+        client.put("/api/settings", json={"max_parallel_jobs": 3}, headers=H)
