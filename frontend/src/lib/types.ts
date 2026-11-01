@@ -63,3 +63,14 @@ export type Playlist = {
 	bytes?: number;
 	job?: any;
 };
+
+/** selected tracks of one playlist, and whether that playlist can be changed on YouTube */
+export type EditGroup = {
+	playlist_id: number;
+	title: string;
+	item_ids: number[];
+	writable: boolean;
+	reason: string | null;
+	files_follow: boolean;
+	syncing: boolean;
+};

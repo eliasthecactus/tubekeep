@@ -158,7 +158,7 @@
 
 	{#if job}<JobCard {job} />{/if}
 
-	<ItemTable playlistId={id} counts={p.counts} writable={!!access?.writable} filesFollowPlaylist={p.on_removed === 'delete'} onchanged={load} />
+	<ItemTable playlistId={id} counts={p.counts} writable={!!access?.writable} onchanged={load} />
 
 	<Modal bind:open={editOpen} title="Edit playlist" width="640px">
 		<PlaylistForm bind:v={form} mode="edit" {accounts} {proxies} originalFolder={p.folder ?? ''} />

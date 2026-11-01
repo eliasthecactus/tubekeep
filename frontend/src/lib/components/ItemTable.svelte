@@ -4,7 +4,7 @@
 	import { get, post, qs } from '../api';
 	import { ago, bytes, duration } from '../format';
 	import { errorToast, itemProgress, on, toast } from '../state.svelte';
-	import type { Item } from '../types';
+	import type { EditGroup, Item } from '../types';
 	import StatusBadge from './StatusBadge.svelte';
 	import BulkEditor from './BulkEditor.svelte';
 	import ItemEditor from './ItemEditor.svelte';
@@ -16,7 +16,6 @@
 		counts = null,
 		playlists = [],
 		writable = false,
-		filesFollowPlaylist = false,
 		onchanged
 	}: {
 		playlistId?: number | null;
@@ -24,8 +23,6 @@
 		playlists?: { id: number; title: string | null; url: string }[];
 		/** the playlist's account can edit the YouTube playlist */
 		writable?: boolean;
-		/** the playlist deletes files of tracks removed from YouTube */
-		filesFollowPlaylist?: boolean;
 		onchanged?: () => void;
 	} = $props();
 
@@ -63,7 +60,16 @@
 	let removeFiles = $state(false);
 	let removing = $state(false);
 	let altOpen = $state(false);
-	let altIds = $state<number[]>([]);
+	// selected tracks grouped by playlist, with edit access, fetched when a YouTube action is opened
+	let editGroups = $state<EditGroup[]>([]);
+	let editBusy = $state(false);
+	const editable = $derived(editGroups.filter((g) => g.writable));
+	const readOnly = $derived(editGroups.filter((g) => !g.writable));
+	const removable = $derived(editable.filter((g) => !g.syncing));
+	const notRemovable = $derived([...readOnly, ...editable.filter((g) => g.syncing)]);
+	const removeCount = $derived(removable.reduce((n, g) => n + g.item_ids.length, 0));
+	const removeAllFollow = $derived(removable.length > 0 && removable.every((g) => g.files_follow));
+	const removeSomeFollow = $derived(removable.some((g) => g.files_follow));
 	let coverV = $state(Date.now());
 	const LIMIT = 200;
 
@@ -184,11 +190,14 @@
 	async function removeFromYouTube() {
 		removing = true;
 		try {
-			const r = await post(`/playlists/${playlistId}/remove`, { item_ids: ids, delete_files: removeFiles });
+			const r = await post('/items/remove', { item_ids: removable.flatMap((g) => g.item_ids), delete_files: removeFiles });
 			const parts = [`Removed ${r.removed} from YouTube`];
-			if (r.already_gone) parts.push(`${r.already_gone} were already gone`);
+			if (r.playlists > 1) parts[0] += ` in ${r.playlists} playlists`;
+			if (r.already_gone) parts.push(`${r.already_gone} ${r.already_gone === 1 ? 'was' : 'were'} already gone`);
 			if (r.deleted_files) parts.push(`${r.deleted_files} files deleted`);
-			toast(parts.join(', '), 'ok');
+			const skipped = r.skipped.reduce((n: number, x: any) => n + x.tracks, 0);
+			if (skipped) parts.push(`${skipped} skipped (${r.skipped.map((x: any) => `${x.title}: ${x.reason}`).join('; ')})`);
+			toast(parts.join(', '), skipped ? 'error' : 'ok');
 			confirmRemove = false;
 			load();
 			onchanged?.();
@@ -198,13 +207,33 @@
 			removing = false;
 		}
 	}
-	function openRemove() {
-		removeFiles = filesFollowPlaylist;
+	/** groups the selection by playlist; false when nothing of it can be changed on YouTube */
+	async function loadEditGroups(): Promise<boolean> {
+		editBusy = true;
+		try {
+			editGroups = await post<EditGroup[]>('/items/edit-targets', { item_ids: ids });
+		} catch (e) {
+			errorToast(e);
+			return false;
+		} finally {
+			editBusy = false;
+		}
+		if (editable.length) return true;
+		const why = [...new Set(readOnly.map((g) => g.reason).filter(Boolean))];
+		toast(`None of the selected tracks can be changed on YouTube${why.length ? `: ${why.join('; ')}` : ''}`, 'error');
+		return false;
+	}
+	async function openRemove() {
+		if (!(await loadEditGroups())) return;
+		if (!removable.length) {
+			toast('Wait until the sync of these playlists is finished', 'error');
+			return;
+		}
+		removeFiles = removeAllFollow;
 		confirmRemove = true;
 	}
-	function openAlternatives() {
-		altIds = [...selected];
-		altOpen = true;
+	async function openAlternatives() {
+		if (await loadEditGroups()) altOpen = true;
 	}
 	function openBulk(mode: 'ops' | 'ai') {
 		bulkMode = mode;
@@ -267,9 +296,9 @@
 		<button class="sm" onclick={() => action('ignore')}><EyeOff size={14} /> Ignore</button>
 		<button class="sm" onclick={() => action('unignore')}><Eye size={14} /> Unignore</button>
 		<button class="sm danger" onclick={() => (confirmDelete = true)}><Trash2 size={14} /> Delete files</button>
-		{#if playlistId && writable}
-			<button class="sm" onclick={openAlternatives} title="Search YouTube Music for a working version"><Replace size={14} /> Find alternatives</button>
-			<button class="sm danger" onclick={openRemove} title="Remove from the playlist on YouTube"><ListX size={14} /> Remove from YouTube</button>
+		{#if !playlistId || writable}
+			<button class="sm" onclick={openAlternatives} disabled={editBusy} title="Search YouTube Music for a working version"><Replace size={14} /> Find alternatives</button>
+			<button class="sm danger" onclick={openRemove} disabled={editBusy} title="Remove from the playlist on YouTube"><ListX size={14} /> Remove from YouTube</button>
 		{/if}
 		<button class="ghost icon sm" onclick={() => selected.clear()} title="Clear selection"><X size={15} /></button>
 	</div>
@@ -343,19 +372,31 @@
 <BulkEditor bind:open={bulkOpen} itemIds={ids} mode={bulkMode} onapplied={() => { load(); coverV = Date.now(); }} />
 <ItemEditor bind:itemId={editId} onchanged={() => load()} />
 
-{#if playlistId}
-	<AlternativesModal bind:open={altOpen} {playlistId} itemIds={altIds} {items} {filesFollowPlaylist} onchanged={() => { load(); onchanged?.(); }} />
-{/if}
+<AlternativesModal bind:open={altOpen} groups={editable} skipped={readOnly} {items} onchanged={() => { load(); onchanged?.(); }} />
 
-<Modal bind:open={confirmRemove} title="Remove {selected.size} track{selected.size === 1 ? '' : 's'} from YouTube?" width="480px">
+<Modal bind:open={confirmRemove} title="Remove {removeCount} track{removeCount === 1 ? '' : 's'} from YouTube?" width="480px">
 	<div class="warnbox">
 		<TriangleAlert size={16} />
-		<span>This removes the track{selected.size === 1 ? '' : 's'} from the <b>real playlist on YouTube</b>, not only from Tubekeep. Tubekeep can't undo it.</span>
+		<span>This removes the track{removeCount === 1 ? '' : 's'} from the <b>real playlist{removable.length === 1 ? '' : 's'} on YouTube</b>, not only from Tubekeep. Tubekeep can't undo it.</span>
 	</div>
-	{#if filesFollowPlaylist}
-		<p class="small muted" style="margin-top: 12px">This playlist deletes files of removed tracks, so downloaded files are deleted too.</p>
+	{#if removable.length > 1 || notRemovable.length}
+		<ul class="groups small">
+			{#each removable as g (g.playlist_id)}
+				<li><span class="ellipsis">{g.title}</span><span class="muted">{g.item_ids.length} track{g.item_ids.length === 1 ? '' : 's'}</span></li>
+			{/each}
+			{#each notRemovable as g (g.playlist_id)}
+				<li class="skip" title={g.syncing ? 'Wait until the sync of this playlist is finished' : (g.reason ?? 'Read-only')}>
+					<span class="ellipsis">{g.title}</span>
+					<span class="muted">{g.item_ids.length} skipped, {g.syncing && g.writable ? 'syncing' : 'read-only'}</span>
+				</li>
+			{/each}
+		</ul>
+	{/if}
+	{#if removeAllFollow}
+		<p class="small muted" style="margin-top: 12px">{removable.length === 1 ? 'This playlist deletes' : 'These playlists delete'} files of removed tracks, so downloaded files are deleted too.</p>
 	{:else}
 		<label class="check" style="margin-top: 12px"><input type="checkbox" bind:checked={removeFiles} /> Also delete the downloaded files</label>
+		{#if removeSomeFollow}<p class="small muted">Playlists that delete files of removed tracks always delete them.</p>{/if}
 	{/if}
 	{#snippet footer()}
 		<button onclick={() => (confirmRemove = false)}>Cancel</button>
@@ -384,6 +425,25 @@
 		color: var(--warn);
 		flex-shrink: 0;
 		margin-top: 2px;
+	}
+	.groups {
+		list-style: none;
+		margin: 12px 0 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		max-height: 200px;
+		overflow-y: auto;
+	}
+	.groups li {
+		display: flex;
+		justify-content: space-between;
+		gap: 12px;
+		min-width: 0;
+	}
+	.groups li.skip {
+		color: var(--text-3);
 	}
 	.toolbar {
 		display: flex;

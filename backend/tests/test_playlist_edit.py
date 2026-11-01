@@ -197,6 +197,38 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert r.status_code == 400 and "can't edit" in r.json()["detail"]
 
 
+def test_library_edits_across_playlists(client, fake_yt, yt):
+    ents = [{"id": "libone00001", "title": "Lib One", "channel": "Chan", "duration": 100},
+            {"id": "libtwo00002", "title": "Lib Two", "channel": "Chan", "duration": 100}]
+    (fake_yt / "playlist.json").write_text(json.dumps({"_type": "playlist", "id": "PLlib", "title": "Lib",
+                                                        "entries": ents}))
+    mine = client.post("/api/playlists", json={"url": "https://www.youtube.com/playlist?list=PLlibmine"},
+                       headers=H).json()["created"][0]
+    other = client.post("/api/playlists", json={"url": "https://www.youtube.com/playlist?list=PLlibother"},
+                        headers=H).json()["created"][0]
+    wait_jobs(client)
+    acc = db.insert("accounts", {"label": "lib", "cookies_enc": crypto.encrypt(COOKIES), "status": "valid",
+                                 "cookies_updated_at": db.now(), "created_at": db.now()})
+    client.patch(f"/api/playlists/{mine}", json={"account_id": acc}, headers=H)
+    client.get(f"/api/playlists/{mine}/access?refresh=true")
+    client.get(f"/api/playlists/{other}/access?refresh=true")
+    yt.tracks = [yt.entry("libone00001", "Lib One"), yt.entry("libtwo00002", "Lib Two")]
+    a, b = items(client, mine)["libone00001"], items(client, other)["libone00001"]
+
+    groups = client.post("/api/items/edit-targets", json={"item_ids": [b["id"], a["id"]]}, headers=H).json()
+    assert [(g["playlist_id"], g["writable"], g["item_ids"]) for g in groups] == \
+        [(mine, True, [a["id"]]), (other, False, [b["id"]])]
+    assert "account" in groups[1]["reason"]
+
+    r = client.post("/api/items/remove", json={"item_ids": [a["id"], b["id"]]}, headers=H).json()
+    assert (r["removed"], r["playlists"]) == (1, 1)
+    assert [(s["playlist_id"], s["tracks"]) for s in r["skipped"]] == [(other, 1)]
+    assert [t["videoId"] for t in yt.tracks] == ["libtwo00002"]
+    assert items(client, mine)["libone00001"]["removed_at"]
+    assert not items(client, other)["libone00001"]["removed_at"]
+    assert client.post("/api/items/edit-targets", json={"item_ids": []}, headers=H).status_code == 400
+
+
 def test_source_of_placeholders_and_video_titles():
     item = {"video_id": "x", "title": "[Private video]", "channel": None, "duration": None, "meta": None,
             "meta_override": None, "yt_artist": None, "yt_track": None}

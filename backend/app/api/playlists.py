@@ -409,6 +409,70 @@ async def use_alternative(pid: int, item_id: int, body: AlternativeIn):
                                                                     body.delete_file))
 
 
+# the library mixes tracks of many playlists: group them, edit the ones the linked account can change
+
+class ItemIdsIn(BaseModel):
+    item_ids: list[int]
+
+
+def _syncing() -> set[int]:
+    return {j["playlist_id"] for j in manager.live() if j["type"] == "sync"}
+
+
+async def _edit_groups(item_ids: list[int]) -> list[dict]:
+    if not item_ids:
+        raise HTTPException(400, "No tracks selected")
+    marks = ",".join("?" for _ in item_ids)
+    rows = db.rows(f"SELECT i.id, i.playlist_id, p.title, p.url, p.on_removed FROM items i "
+                   f"JOIN playlists p ON p.id = i.playlist_id WHERE i.id IN ({marks}) ORDER BY i.playlist_id",
+                   item_ids)
+    groups: dict[int, dict] = {}
+    for r in rows:
+        g = groups.setdefault(r["playlist_id"], {"playlist_id": r["playlist_id"], "title": r["title"] or r["url"],
+                                                 "files_follow": r["on_removed"] == "delete", "item_ids": []})
+        g["item_ids"].append(r["id"])
+    syncing = _syncing()
+    for g in groups.values():
+        try:
+            a = await playlist_edit.access(g["playlist_id"])
+            g["writable"], g["reason"] = a["writable"], a["reason"]
+        except (playlist_edit.EditError, ProviderError) as e:
+            g["writable"], g["reason"] = False, str(e)
+        g["syncing"] = g["playlist_id"] in syncing
+    return sorted(groups.values(), key=lambda g: (not g["writable"], (g["title"] or "").lower()))
+
+
+@router.post("/items/edit-targets")
+async def edit_targets(body: ItemIdsIn):
+    """Which of the selected tracks can be changed on YouTube, grouped per playlist."""
+    return await _edit_groups(body.item_ids)
+
+
+@router.post("/items/remove")
+async def remove_items_from_youtube(body: RemoveIn):
+    """Removes tracks of several playlists. Read-only or syncing playlists are skipped, not failed."""
+    out = {"removed": 0, "already_gone": 0, "deleted_files": 0, "playlists": 0, "skipped": []}
+    for g in await _edit_groups(body.item_ids):
+        reason = None
+        if not g["writable"]:
+            reason = g["reason"] or "Read-only"
+        elif g["playlist_id"] in _syncing():
+            reason = "Wait until the sync of this playlist is finished"
+        else:
+            try:
+                r = await playlist_edit.remove(g["playlist_id"], g["item_ids"], body.delete_files)
+            except (playlist_edit.EditError, ProviderError) as e:
+                reason = str(e)
+            else:
+                out["playlists"] += 1
+                for k in ("removed", "already_gone", "deleted_files"):
+                    out[k] += r[k]
+        if reason:
+            out["skipped"].append({"playlist_id": g["playlist_id"], "title": g["title"],
+                                   "tracks": len(g["item_ids"]), "reason": reason})
+    return out
+
+
 # ------------------------------------------------------------------ folder marker missing
 
 class StorageIn(BaseModel):

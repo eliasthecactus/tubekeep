@@ -4,7 +4,7 @@
 	import { post } from '../api';
 	import { duration } from '../format';
 	import { errorToast, toast } from '../state.svelte';
-	import type { Item } from '../types';
+	import type { EditGroup, Item } from '../types';
 	import Modal from './Modal.svelte';
 
 	type Cand = {
@@ -21,6 +21,7 @@
 	};
 	type Row = {
 		id: number;
+		group: EditGroup;
 		item: Item | undefined;
 		query: string;
 		source: { title: string; artists: string[]; duration: number | null; known: boolean } | null;
@@ -33,19 +34,24 @@
 
 	let {
 		open = $bindable(false),
-		playlistId,
-		itemIds,
+		groups,
+		skipped = [],
 		items = [],
-		filesFollowPlaylist = false,
 		onchanged
 	}: {
 		open?: boolean;
-		playlistId: number;
-		itemIds: number[];
+		/** the selected tracks of playlists that can be edited */
+		groups: EditGroup[];
+		/** selected tracks of read-only playlists, only mentioned */
+		skipped?: EditGroup[];
 		items?: Item[];
-		filesFollowPlaylist?: boolean;
 		onchanged?: () => void;
 	} = $props();
+
+	const total = $derived(groups.reduce((n, g) => n + g.item_ids.length, 0));
+	const skippedTracks = $derived(skipped.reduce((n, g) => n + g.item_ids.length, 0));
+	const allFollow = $derived(groups.length > 0 && groups.every((g) => g.files_follow));
+	const someFollow = $derived(groups.some((g) => g.files_follow));
 
 	const MAX = 20;
 	let rows = $state<Row[]>([]);
@@ -55,8 +61,8 @@
 		if (open) untrack(start); // only when it opens, not when the parent reloads its items
 	});
 	function start() {
-		const ids = itemIds.slice(0, MAX);
-		rows = ids.map((id) => ({ id, item: items.find((i) => i.id === id), query: '', source: null, cands: [], loading: true, error: '', done: '', busy: '' }));
+		const all = groups.flatMap((group) => group.item_ids.map((id) => ({ id, group })));
+		rows = all.slice(0, MAX).map(({ id, group }) => ({ id, group, item: items.find((i) => i.id === id), query: '', source: null, cands: [], loading: true, error: '', done: '', busy: '' }));
 		deleteOld = false;
 		// two searches at a time, YouTube doesn't like bursts
 		let next = 0;
@@ -71,7 +77,7 @@
 		row.loading = true;
 		row.error = '';
 		try {
-			const r = await post(`/playlists/${playlistId}/items/${row.id}/alternatives`, { query: query ?? null });
+			const r = await post(`/playlists/${row.group.playlist_id}/items/${row.id}/alternatives`, { query: query ?? null });
 			row.source = r.source;
 			row.query = r.query;
 			row.cands = r.candidates;
@@ -86,7 +92,7 @@
 	async function apply(row: Row, c: Cand, replace: boolean) {
 		row.busy = c.video_id + (replace ? ':r' : ':a');
 		try {
-			const r = await post(`/playlists/${playlistId}/items/${row.id}/alternative`, { candidate: c, replace, delete_file: deleteOld });
+			const r = await post(`/playlists/${row.group.playlist_id}/items/${row.id}/alternative`, { candidate: c, replace, delete_file: deleteOld });
 			row.done = `${replace ? 'Replaced with' : 'Added'} "${c.title}"${r.deleted_file ? ', old file deleted' : ''}`;
 			toast(replace ? 'Replaced on YouTube' : 'Added to the YouTube playlist', 'ok');
 			onchanged?.();
@@ -119,12 +125,19 @@
 		<TriangleAlert size={15} />
 		<span><b>Add</b> and <b>Replace</b> change the real playlist on YouTube, not only Tubekeep. Replace puts the new video where the old one was and removes the old one from YouTube.</span>
 	</div>
-	{#if filesFollowPlaylist}
-		<p class="small muted">This playlist deletes files of removed tracks, so replacing also deletes the old file.</p>
+	{#if allFollow}
+		<p class="small muted">{groups.length === 1 ? 'This playlist deletes' : 'These playlists delete'} files of removed tracks, so replacing also deletes the old file.</p>
 	{:else}
 		<label class="check small"><input type="checkbox" bind:checked={deleteOld} /> When replacing, also delete the old local file</label>
+		{#if someFollow}<p class="small muted">Playlists that delete files of removed tracks always delete the old file.</p>{/if}
 	{/if}
-	{#if itemIds.length > MAX}<p class="small muted">Showing the first {MAX} of {itemIds.length} selected tracks.</p>{/if}
+	{#if total > MAX}<p class="small muted">Showing the first {MAX} of {total} tracks.</p>{/if}
+	{#if skippedTracks}
+		<p class="small muted">
+			Left out {skippedTracks} track{skippedTracks === 1 ? '' : 's'} of playlists that can't be changed on YouTube:
+			{skipped.map((g) => `${g.title} (${g.reason ?? 'read-only'})`).join(', ')}.
+		</p>
+	{/if}
 
 	<div class="rows">
 		{#each rows as row (row.id)}
@@ -136,7 +149,7 @@
 					</div>
 					<div class="grow col" style="min-width: 0">
 						<b class="ellipsis">{l.title || 'Unknown video'}</b>
-						<span class="small faint ellipsis">{[l.artists, duration(row.source?.duration ?? row.item?.duration)].filter(Boolean).join(' · ')}</span>
+						<span class="small faint ellipsis">{[l.artists, duration(row.source?.duration ?? row.item?.duration), groups.length > 1 ? row.group.title : ''].filter(Boolean).join(' · ')}</span>
 					</div>
 					{#if row.done}<span class="pill ok"><Check size={12} /> {row.done}</span>{/if}
 				</div>
