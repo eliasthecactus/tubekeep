@@ -147,8 +147,7 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert r == {"removed": 1, "already_gone": 0, "deleted_files": 1}
     assert [t["videoId"] for t in yt.tracks] == ["keepsong001", "unavail0002", "deadvideo01"]
     assert not path.exists()
-    drop = items(client, pid)["dropsong001"]
-    assert drop["removed_at"] and drop["status"] == "deleted"
+    assert "dropsong001" not in items(client, pid)  # gone from YouTube and from disk: nothing left to show
 
     # alternatives: title known from Tubekeep's own history, best match first, the live version lower
     r = client.post(f"/api/playlists/{pid}/items/{its['unavail0002']['id']}/alternatives", json={},
@@ -177,8 +176,29 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert [t["videoId"] for t in yt.tracks] == ["keepsong001", "onemoretim1", "deadvideo01"]
     wait_jobs(client)
     now = items(client, pid)
-    assert now["unavail0002"]["removed_at"]
+    assert "unavail0002" not in now  # replaced and never downloaded: forgotten
     assert now["onemoretim1"]["status"] == "done" and not now["onemoretim1"]["removed_at"]
+
+    # a sync whose youtube.com listing lags behind: the new track isn't listed yet, but YouTube Music has it,
+    # so it isn't marked as removed. YouTube stays the source of truth: what youtube.com still lists comes back
+    stale = [e for e in ents if e["id"] != "onemoretim1"]
+    (fake_yt / "playlist.json").write_text(json.dumps({"_type": "playlist", "id": "PLedit", "title": "Edit me",
+                                                        "entries": stale}))
+    client.post(f"/api/playlists/{pid}/sync", headers=H)
+    wait_jobs(client)
+    now = items(client, pid)
+    assert not now["onemoretim1"]["removed_at"]
+    assert not now["unavail0002"]["removed_at"] and not now["dropsong001"]["removed_at"]
+    # once youtube.com catches up, the guard isn't needed any more
+    fresh = [e for e in ents if e["id"] not in ("unavail0002", "dropsong001")]
+    (fake_yt / "playlist.json").write_text(json.dumps({"_type": "playlist", "id": "PLedit", "title": "Edit me",
+                                                        "entries": fresh}))
+    client.post(f"/api/playlists/{pid}/sync", headers=H)
+    wait_jobs(client)
+    now = items(client, pid)
+    assert not now["onemoretim1"]["removed_at"]
+    assert "unavail0002" not in now  # removed and without a file: forgotten
+    assert now["dropsong001"]["removed_at"] and now["dropsong001"]["file_path"]  # came back and downloaded meanwhile
 
     # add only: the dead entry stays
     best = client.post(f"/api/playlists/{pid}/items/{its['deadvideo01']['id']}/alternatives", json={},
@@ -188,6 +208,34 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert [t["videoId"] for t in yt.tracks] == ["keepsong001", "onemoretim1", "deadvideo01", "wonderwall1"]
     assert not items(client, pid)["deadvideo01"]["removed_at"]
     wait_jobs(client)
+
+    # YouTube says "succeeded" but the track isn't in the playlist: an error, and Tubekeep changes nothing
+    real_add = yt.add_playlist_items
+    yt.add_playlist_items = lambda pid_, ids, duplicates=False: {"status": "STATUS_SUCCEEDED",
+                                                                 "playlistEditResults": []}
+    before = items(client, pid)
+    cand = {"video_id": "wondercover", "title": "Wonderwall (Cover)", "artists": ["Someone"], "kind": "song"}
+    r = client.post(f"/api/playlists/{pid}/items/{its['deadvideo01']['id']}/alternative",
+                    json={"candidate": cand, "replace": True}, headers=H)
+    assert r.status_code == 400 and "isn't in the playlist" in r.json()["detail"]
+    assert items(client, pid).keys() == before.keys() and not items(client, pid)["deadvideo01"]["removed_at"]
+    yt.add_playlist_items = real_add
+
+    # a track removed on YouTube by someone else keeps its file; Forget drops it from Tubekeep, file stays
+    keep_path = Path(items(client, pid)["keepsong001"]["file_path"])
+    yt.tracks = [t for t in yt.tracks if t["videoId"] != "keepsong001"]
+    (fake_yt / "playlist.json").write_text(json.dumps({"_type": "playlist", "id": "PLedit", "title": "Edit me",
+                                                        "entries": [e for e in fresh if e["id"] != "keepsong001"]}))
+    client.post(f"/api/playlists/{pid}/sync", headers=H)
+    wait_jobs(client)
+    gone = items(client, pid)["keepsong001"]
+    assert gone["removed_at"] and keep_path.exists()
+    shown = {i["video_id"] for i in client.get(f"/api/playlists/{pid}/items").json()["items"]}
+    assert "keepsong001" not in shown  # the default list leaves removed tracks out
+    r = client.post("/api/items/action", json={"item_ids": [gone["id"], now["onemoretim1"]["id"]],
+                                               "action": "forget"}, headers=H).json()
+    assert r["forgotten"] == 1  # the track still in the playlist is left alone
+    assert "keepsong001" not in items(client, pid) and keep_path.exists()
 
     # someone else's playlist: read-only
     yt.owned = False

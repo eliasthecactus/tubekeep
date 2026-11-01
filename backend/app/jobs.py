@@ -317,9 +317,29 @@ class Manager:
                 await asyncio.sleep(5 * (attempt + 1))
         raise JobError(last)
 
-    def _upsert(self, ctx: Ctx, pl: dict, data: dict) -> None:
+    @staticmethod
+    def _entries(data: dict) -> list[dict]:
         entries = data.get("entries") if data.get("_type") == "playlist" or "entries" in data else [data]
-        entries = [e for e in (entries or []) if e and e.get("id")]
+        return [e for e in (entries or []) if e and e.get("id")]
+
+    async def _double_check(self, ctx: Ctx, pl: dict, data: dict) -> set[str]:
+        """yt-dlp reads youtube.com, which can lag behind YouTube Music (where Tubekeep makes its edits).
+        Before calling a track removed, ask YouTube Music too: still there means not removed."""
+        from . import playlist_edit
+        listed = {e["id"] for e in self._entries(data)}
+        missing = {r["video_id"] for r in db.rows(
+            "SELECT video_id FROM items WHERE playlist_id = ? AND removed_at IS NULL", [pl["id"]])} - listed
+        if not missing:
+            return set()
+        ytm = await playlist_edit.youtube_music_ids(pl)
+        keep = missing & ytm if ytm else set()
+        if keep:
+            ctx.log(f"Not marking {len(keep)} track(s) as removed: still in the playlist on YouTube Music "
+                    f"({', '.join(sorted(keep))})")
+        return keep
+
+    def _upsert(self, ctx: Ctx, pl: dict, data: dict, keep: set[str] = frozenset()) -> None:
+        entries = self._entries(data)
         now = db.now()
         existing = {r["video_id"]: r for r in db.rows(
             "SELECT id, video_id, status, removed_at FROM items WHERE playlist_id = ?", [pl["id"]])}
@@ -364,7 +384,8 @@ class Manager:
                         status = "pending"  # re-added after its file was deleted
                     c.execute("UPDATE items SET position = ?, removed_at = NULL, status = ?, updated_at = ?, copies = ? "
                               "WHERE id = ?", [pos, status, now, copies[vid], ex["id"]])
-            removed_ids = [r["id"] for v, r in existing.items() if v not in seen and r["removed_at"] is None]
+            removed_ids = [r["id"] for v, r in existing.items()
+                           if v not in seen and v not in keep and r["removed_at"] is None]
             for rid in removed_ids:
                 c.execute("UPDATE items SET removed_at = ?, updated_at = ? WHERE id = ?", [now, now, rid])
             c.execute("UPDATE playlists SET title = COALESCE(?, title), yt_id = COALESCE(?, yt_id), entry_count = ? "
@@ -594,7 +615,8 @@ class Manager:
             db.update("playlists", pl["id"], {"folder": folder})
             ctx.log(f"Download folder: {folder}")
             await asyncio.to_thread(storage.write_marker, pl, folder)
-        await asyncio.to_thread(self._upsert, ctx, pl, data)
+        keep = await self._double_check(ctx, pl, data)
+        await asyncio.to_thread(self._upsert, ctx, pl, data, keep)
         pl = self._playlist(pl["id"])
         if pl["title"] and ctx.job["title"] != f"Sync {pl['title']}":
             ctx.job["title"] = f"Sync {pl['title']}"
@@ -606,6 +628,10 @@ class Manager:
         await asyncio.to_thread(self._verify_files, ctx, pl, params.get("redownload"))
         await self._download_all(ctx, pl, acc, await asyncio.to_thread(self._todo, pl, acc))
         await asyncio.to_thread(self._handle_removed, ctx, pl)
+        from . import playlist_edit
+        if forgotten := await asyncio.to_thread(playlist_edit.forget_removed, pl["id"]):
+            ctx.log(f"Forgot {forgotten} removed track(s) without a file")
+            bus.publish("playlist", {"id": pl["id"]})
         ctx.set_phase("finished")
         ctx.log("Sync finished: " + ", ".join(f"{k} {v}" for k, v in ctx.stats.items() if not k.startswith("_")))
 

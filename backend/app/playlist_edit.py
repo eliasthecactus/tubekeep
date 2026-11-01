@@ -84,6 +84,35 @@ async def access(pid: int, refresh: bool = False) -> dict:
     return {"writable": writable, "reason": reason}
 
 
+# ------------------------------------------------------------------ removed tracks and double check for syncs
+
+def forget_removed(pid: int | None = None, item_ids: list[int] | None = None) -> int:
+    """Tracks that left the playlist and have no file (never downloaded, or deleted) have nothing left to show."""
+    sql, params = "DELETE FROM items WHERE removed_at IS NOT NULL AND file_path IS NULL", []
+    if pid is not None:
+        sql += " AND playlist_id = ?"
+        params.append(pid)
+    if item_ids is not None:
+        if not item_ids:
+            return 0
+        sql += f" AND id IN ({','.join('?' for _ in item_ids)})"
+        params += item_ids
+    with db.tx() as c:
+        return c.execute(sql, params).rowcount
+
+
+async def youtube_music_ids(pl: dict) -> set[str] | None:
+    """The playlist as YouTube Music sees it, as a second opinion next to yt-dlp's youtube.com listing.
+    None when there is no linked account or YouTube Music can't be asked."""
+    if not pl.get("account_id") or not accounts.get(pl["account_id"]) or _special(yt_playlist_id(pl)):
+        return None
+    try:
+        entries = await _entries_of(pl, client(pl), fresh=True)
+    except Exception:  # only a second opinion, never fail a sync because of it
+        return None
+    return {e["videoId"] for e in entries if e.get("videoId")}
+
+
 async def _require_writable(pl: dict) -> YouTubeMusic:
     a = await access(pl["id"])
     if not a["writable"]:
@@ -144,6 +173,7 @@ async def remove(pid: int, item_ids: list[int], delete_files: bool) -> dict:
     # a playlist that deletes files of removed tracks would do it on the next sync anyway
     delete_files = delete_files or pl["on_removed"] == "delete"
     deleted = sum(_mark_removed(it, delete_files) for it in items)
+    forget_removed(pid, [it["id"] for it in items])
     return {"removed": len(videos), "already_gone": len(items) - len({v["videoId"] for v in videos}),
             "deleted_files": deleted}
 
@@ -322,6 +352,13 @@ async def apply_alternative(pid: int, item_id: int, cand: dict, replace: bool, d
                 ytid, [{"videoId": old_entry["videoId"], "setVideoId": old_entry["setVideoId"]}]))
     _entries.pop(ytid, None)
 
+    # trust YouTube's playlist, not its "succeeded": Tubekeep only changes its own state once the edit is there
+    after = await _entries_of(pl, yt, fresh=True)
+    if not any(e.get("videoId") == vid for e in after):
+        raise EditError("YouTube said it added the track, but it isn't in the playlist. Nothing was changed.")
+    if replace and old_entry and any(e.get("setVideoId") == old_entry["setVideoId"] for e in after):
+        raise EditError("The new track was added, but YouTube kept the old one. Remove it from YouTube or try again.")
+
     now = db.now()
     title = cand.get("title") or None
     artists = ", ".join(a for a in cand.get("artists") or [] if a) or None
@@ -344,6 +381,8 @@ async def apply_alternative(pid: int, item_id: int, cand: dict, replace: bool, d
         new_id = db.insert("items", {"playlist_id": pid, "video_id": vid, "position": position, "status": "pending",
                                      "first_seen_at": now, "updated_at": now})
     deleted = _mark_removed(old, delete_file or pl["on_removed"] == "delete") if replace else False
+    if replace:
+        forget_removed(pid, [old["id"]])  # nothing left of it without a file
     item_event(new_id)
     if db.scalar("SELECT status FROM items WHERE id = ?", [new_id]) == "pending":
         manager.enqueue("download", pid, {"item_ids": [new_id]})

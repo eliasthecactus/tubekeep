@@ -349,6 +349,13 @@ def item_action(body: dict):
         for r in db.rows(f"SELECT id, file_path FROM items WHERE id IN ({marks})", ids):
             playlist_edit.delete_item_file(r)  # keeps a file another playlist still uses
             db.update("items", r["id"], {"status": "ignored", "file_path": None, "file_size": None})
+    elif action in ("forget", "forget_delete"):
+        # only tracks that are no longer in their YouTube playlist; the file stays unless asked otherwise
+        rows = db.rows(f"SELECT id, file_path FROM items WHERE id IN ({marks}) AND removed_at IS NOT NULL", ids)
+        deleted = sum(playlist_edit.delete_item_file(r) for r in rows if action == "forget_delete")
+        if rows:
+            db.execute(f"DELETE FROM items WHERE id IN ({','.join('?' for _ in rows)})", [r["id"] for r in rows])
+        return {"ok": True, "forgotten": len(rows), "deleted_files": deleted}
     else:
         raise HTTPException(400, "Unknown action")
     return {"ok": True}

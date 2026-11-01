@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Search, Wand2, Sparkles, Image, Download, RotateCcw, EyeOff, Eye, Trash2, X, Music, Loader, ListX, Replace, TriangleAlert } from '@lucide/svelte';
+	import { Search, Wand2, Sparkles, Image, Download, RotateCcw, EyeOff, Eye, Trash2, X, Music, Loader, ListX, Replace, TriangleAlert, Eraser } from '@lucide/svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { get, post, qs } from '../api';
 	import { ago, bytes, duration } from '../format';
@@ -84,7 +84,7 @@
 		const f = FILTERS.find((x) => x.key === filter)!;
 		return {
 			status: f.status,
-			removed: f.removed ?? (filter === 'all' ? 'include' : undefined),
+			removed: f.removed, // removed tracks only show under "Removed from playlist"
 			q: qDebounced,
 			sort,
 			offset,
@@ -159,6 +159,22 @@
 		try {
 			await post('/items/action', { item_ids: ids, action: name });
 			toast('Done', 'ok');
+			load();
+			onchanged?.();
+		} catch (e) {
+			errorToast(e);
+		}
+	}
+	// tracks no longer in their YouTube playlist can be forgotten (the button shows when such a track is selected)
+	const removedSelected = $derived(filter === 'removed' || items.some((i) => i.removed_at && selected.has(i.id)));
+	let confirmForget = $state(false);
+	let forgetFiles = $state(false);
+	async function forget() {
+		confirmForget = false;
+		try {
+			const r = await post('/items/action', { item_ids: ids, action: forgetFiles ? 'forget_delete' : 'forget' });
+			toast(`Forgot ${r.forgotten} track${r.forgotten === 1 ? '' : 's'}` + (r.deleted_files ? `, deleted ${r.deleted_files} file${r.deleted_files === 1 ? '' : 's'}` : ''), 'ok');
+			selected.clear();
 			load();
 			onchanged?.();
 		} catch (e) {
@@ -296,6 +312,9 @@
 		<button class="sm" onclick={() => action('ignore')}><EyeOff size={14} /> Ignore</button>
 		<button class="sm" onclick={() => action('unignore')}><Eye size={14} /> Unignore</button>
 		<button class="sm danger" onclick={() => (confirmDelete = true)}><Trash2 size={14} /> Delete files</button>
+		{#if removedSelected}
+			<button class="sm" onclick={() => { forgetFiles = false; confirmForget = true; }} title="Remove tracks that are no longer in their YouTube playlist from Tubekeep"><Eraser size={14} /> Forget</button>
+		{/if}
 		{#if !playlistId || writable}
 			<button class="sm" onclick={openAlternatives} disabled={editBusy} title="Search YouTube Music for a working version"><Replace size={14} /> Find alternatives</button>
 			<button class="sm danger" onclick={openRemove} disabled={editBusy} title="Remove from the playlist on YouTube"><ListX size={14} /> Remove from YouTube</button>
@@ -409,6 +428,15 @@
 	{#snippet footer()}
 		<button onclick={() => (confirmDelete = false)}>Cancel</button>
 		<button class="danger solid" onclick={() => { confirmDelete = false; action('delete_file'); }}>Delete files</button>
+	{/snippet}
+</Modal>
+
+<Modal bind:open={confirmForget} title="Forget removed tracks?" width="460px">
+	<p>Selected tracks that are no longer in their YouTube playlist disappear from Tubekeep. Tracks still in a playlist are left alone. If one is added to the playlist again, it shows up as a new track.</p>
+	<label class="check small"><input type="checkbox" bind:checked={forgetFiles} /> Also delete their files (files another playlist still uses are kept)</label>
+	{#snippet footer()}
+		<button onclick={() => (confirmForget = false)}>Cancel</button>
+		<button class={forgetFiles ? 'danger solid' : 'primary'} onclick={forget}>{forgetFiles ? 'Forget and delete files' : 'Forget'}</button>
 	{/snippet}
 </Modal>
 
