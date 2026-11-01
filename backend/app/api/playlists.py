@@ -7,8 +7,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .. import auth, db, library, scheduler, settings_store
+from .. import auth, db, library, playlist_edit, scheduler, settings_store
 from ..jobs import manager
+from ..providers.base import ProviderError
 
 router = APIRouter(prefix="/api", dependencies=[Depends(auth.require_user)])
 
@@ -352,3 +353,54 @@ def item_action(body: dict):
     else:
         raise HTTPException(400, "Unknown action")
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ changes to the YouTube playlist
+
+class RemoveIn(BaseModel):
+    item_ids: list[int]
+    delete_files: bool = False
+
+
+class AlternativesIn(BaseModel):
+    query: str | None = None
+
+
+class AlternativeIn(BaseModel):
+    candidate: dict[str, Any]
+    replace: bool = False
+    delete_file: bool = False
+
+
+async def _edit(pid: int, coro_fn, check_job: bool = True):
+    if check_job and any(j["playlist_id"] == pid and j["type"] == "sync" for j in manager.live()):
+        raise HTTPException(409, "Wait until the sync of this playlist is finished")
+    try:
+        return await coro_fn()
+    except playlist_edit.EditError as e:
+        raise HTTPException(404 if "not found" in str(e) else 400, str(e))
+    except ProviderError as e:  # incl. expired cookies; never 401, that would log the user out of Tubekeep
+        raise HTTPException(502, str(e))
+
+
+@router.get("/playlists/{pid}/access")
+async def playlist_access(pid: int, refresh: bool = False):
+    return await _edit(pid, lambda: playlist_edit.access(pid, refresh), check_job=False)
+
+
+@router.post("/playlists/{pid}/remove")
+async def remove_from_youtube(pid: int, body: RemoveIn):
+    if not body.item_ids:
+        raise HTTPException(400, "No tracks selected")
+    return await _edit(pid, lambda: playlist_edit.remove(pid, body.item_ids, body.delete_files))
+
+
+@router.post("/playlists/{pid}/items/{item_id}/alternatives")
+async def find_alternatives(pid: int, item_id: int, body: AlternativesIn):
+    return await _edit(pid, lambda: playlist_edit.alternatives(pid, item_id, body.query), check_job=False)
+
+
+@router.post("/playlists/{pid}/items/{item_id}/alternative")
+async def use_alternative(pid: int, item_id: int, body: AlternativeIn):
+    return await _edit(pid, lambda: playlist_edit.apply_alternative(pid, item_id, body.candidate, body.replace,
+                                                                    body.delete_file))

@@ -24,7 +24,8 @@ def _set_cookie(request: Request, response: Response, token: str) -> None:
 
 @router.get("/state")
 def state(request: Request):
-    return {"setup_needed": not auth.has_users(), "user": auth.session_user(request.cookies.get(auth.COOKIE))}
+    return {"setup_needed": not auth.has_users(), "user": auth.session_user(request.cookies.get(auth.COOKIE)),
+            "version": auth.config.VERSION}
 
 
 @router.post("/setup")

@@ -32,6 +32,7 @@
 			const s = await get('/auth/state');
 			session.setupNeeded = s.setup_needed;
 			session.user = s.user;
+			session.version = s.version ?? '';
 		} catch {
 			/* server down */
 		}
@@ -111,6 +112,7 @@
 				</div>
 				<div class="row">
 					<span class="small muted grow ellipsis">{session.user.username}</span>
+					{#if session.version}<a class="small faint version" href="https://github.com/eliasthecactus/tubekeep/releases" target="_blank" rel="noreferrer" title="Tubekeep version">v{session.version}</a>{/if}
 					<button class="ghost icon sm" onclick={logout} title="Log out"><LogOut size={15} /></button>
 				</div>
 			</div>
@@ -197,6 +199,12 @@
 		gap: 6px;
 		border-top: 1px solid var(--line);
 		padding: 10px 6px 0;
+	}
+	.version {
+		font-variant-numeric: tabular-nums;
+	}
+	.version:hover {
+		color: var(--text-2);
 	}
 	.dot {
 		width: 8px;

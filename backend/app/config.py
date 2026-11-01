@@ -18,6 +18,8 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 APP_SECRET = os.environ.get("APP_SECRET", "").strip()
 SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))
+_VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.exists() else "dev"
 # Set to 1 to disable the background yt-dlp/account/proxy loops (tests).
 DISABLE_BACKGROUND = os.environ.get("TUBEKEEP_DISABLE_BACKGROUND", "") == "1"
 

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { RefreshCw, FileSearch, Pencil, Trash2, ExternalLink, Folder, Lock, Clock, ArrowLeft } from '@lucide/svelte';
+	import { RefreshCw, FileSearch, Pencil, Trash2, ExternalLink, Folder, Lock, Clock, ArrowLeft, PenLine, Eye } from '@lucide/svelte';
 	import { del, get, patch, post } from '#lib/api.ts';
 	import { ago, bytes, scheduleLabel, until } from '#lib/format.ts';
 	import { errorToast, jobForPlaylist, on, toast } from '#lib/state.svelte.ts';
@@ -22,6 +22,7 @@
 	let accounts = $state<any[]>([]);
 	let proxies = $state<any[]>([]);
 	let busy = $state(false);
+	let access = $state<{ writable: boolean; reason: string | null } | null>(null);
 
 	async function load() {
 		try {
@@ -30,9 +31,18 @@
 			errorToast(e);
 		}
 	}
+	async function loadAccess(refresh = false) {
+		try {
+			access = await get(`/playlists/${id}/access${refresh ? '?refresh=true' : ''}`);
+		} catch {
+			access = null;
+		}
+	}
 	$effect(() => {
 		void id;
 		load();
+		access = null;
+		loadAccess();
 	});
 	let reloadTimer: ReturnType<typeof setTimeout>;
 	function soon() {
@@ -84,6 +94,7 @@
 			});
 			editOpen = false;
 			toast('Saved', 'ok');
+			loadAccess(true);
 		} catch (e) {
 			errorToast(e);
 		} finally {
@@ -111,6 +122,11 @@
 				<a href={p.url} target="_blank" rel="noreferrer" class="row" style="gap: 4px"><ExternalLink size={13} /> YouTube</a>
 				{#if p.folder}<span class="row mono" style="gap: 4px"><Folder size={13} /> {p.folder}</span>{/if}
 				{#if p.account_label}<span class="row" style="gap: 4px"><Lock size={13} /> {p.account_label}</span>{/if}
+				{#if access}
+					<button class="link row" style="gap: 4px" onclick={() => loadAccess(true)} title={access.writable ? 'The linked account can edit this playlist on YouTube. Click to check again.' : `${access.reason ?? 'Read-only'}. Click to check again.`}>
+						{#if access.writable}<PenLine size={13} /> Editable on YouTube{:else}<Eye size={13} /> Read-only{/if}
+					</button>
+				{/if}
 				<span class="row" style="gap: 4px"><Clock size={13} /> {scheduleLabel(p.schedule)}{p.enabled && p.next_run_at ? `, next ${until(p.next_run_at)}` : p.schedule ? ' (paused)' : ''}</span>
 			</div>
 		</div>
@@ -139,7 +155,7 @@
 
 	{#if job}<JobCard {job} />{/if}
 
-	<ItemTable playlistId={id} counts={p.counts} onchanged={load} />
+	<ItemTable playlistId={id} counts={p.counts} writable={!!access?.writable} filesFollowPlaylist={p.on_removed === 'delete'} onchanged={load} />
 
 	<Modal bind:open={editOpen} title="Edit playlist" width="640px">
 		<PlaylistForm bind:v={form} mode="edit" {accounts} {proxies} originalFolder={p.folder ?? ''} />
@@ -160,6 +176,13 @@
 {/if}
 
 <style>
+	.link {
+		all: unset;
+		cursor: pointer;
+	}
+	.link:hover {
+		color: var(--text);
+	}
 	.back {
 		display: inline-flex;
 		align-items: center;

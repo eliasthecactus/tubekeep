@@ -34,10 +34,11 @@ def _to_track(it: dict) -> dict | None:
     if not vid:
         return None
     album = it.get("album")
+    thumbs = it.get("thumbnails") or []
     return track(vid, it.get("title"), _artists(it), album.get("name") if isinstance(album, dict) else None,
                  it.get("duration_seconds"), url=f"https://music.youtube.com/watch?v={vid}",
                  setVideoId=it.get("setVideoId"), videoType=it.get("videoType"),
-                 resultType=it.get("resultType"))
+                 resultType=it.get("resultType"), thumbnail=thumbs[-1].get("url") if thumbs else None)
 
 
 class YouTubeMusic(Provider):

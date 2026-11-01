@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Search, Wand2, Sparkles, Image, Download, RotateCcw, EyeOff, Eye, Trash2, X, Music, Loader } from '@lucide/svelte';
+	import { Search, Wand2, Sparkles, Image, Download, RotateCcw, EyeOff, Eye, Trash2, X, Music, Loader, ListX, Replace, TriangleAlert } from '@lucide/svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { get, post, qs } from '../api';
 	import { ago, bytes, duration } from '../format';
@@ -9,16 +9,23 @@
 	import BulkEditor from './BulkEditor.svelte';
 	import ItemEditor from './ItemEditor.svelte';
 	import Modal from './Modal.svelte';
+	import AlternativesModal from './AlternativesModal.svelte';
 
 	let {
 		playlistId = null,
 		counts = null,
 		playlists = [],
+		writable = false,
+		filesFollowPlaylist = false,
 		onchanged
 	}: {
 		playlistId?: number | null;
 		counts?: Record<string, number> | null;
 		playlists?: { id: number; title: string | null; url: string }[];
+		/** the playlist's account can edit the YouTube playlist */
+		writable?: boolean;
+		/** the playlist deletes files of tracks removed from YouTube */
+		filesFollowPlaylist?: boolean;
 		onchanged?: () => void;
 	} = $props();
 
@@ -52,6 +59,11 @@
 	let bulkMode = $state<'ops' | 'ai'>('ops');
 	let editId = $state<number | null>(null);
 	let confirmDelete = $state(false);
+	let confirmRemove = $state(false);
+	let removeFiles = $state(false);
+	let removing = $state(false);
+	let altOpen = $state(false);
+	let altIds = $state<number[]>([]);
 	let coverV = $state(Date.now());
 	const LIMIT = 200;
 
@@ -169,6 +181,31 @@
 			coverBusy = false;
 		}
 	}
+	async function removeFromYouTube() {
+		removing = true;
+		try {
+			const r = await post(`/playlists/${playlistId}/remove`, { item_ids: ids, delete_files: removeFiles });
+			const parts = [`Removed ${r.removed} from YouTube`];
+			if (r.already_gone) parts.push(`${r.already_gone} were already gone`);
+			if (r.deleted_files) parts.push(`${r.deleted_files} files deleted`);
+			toast(parts.join(', '), 'ok');
+			confirmRemove = false;
+			load();
+			onchanged?.();
+		} catch (e) {
+			errorToast(e);
+		} finally {
+			removing = false;
+		}
+	}
+	function openRemove() {
+		removeFiles = filesFollowPlaylist;
+		confirmRemove = true;
+	}
+	function openAlternatives() {
+		altIds = [...selected];
+		altOpen = true;
+	}
 	function openBulk(mode: 'ops' | 'ai') {
 		bulkMode = mode;
 		bulkOpen = true;
@@ -230,6 +267,10 @@
 		<button class="sm" onclick={() => action('ignore')}><EyeOff size={14} /> Ignore</button>
 		<button class="sm" onclick={() => action('unignore')}><Eye size={14} /> Unignore</button>
 		<button class="sm danger" onclick={() => (confirmDelete = true)}><Trash2 size={14} /> Delete files</button>
+		{#if playlistId && writable}
+			<button class="sm" onclick={openAlternatives} title="Search YouTube Music for a working version"><Replace size={14} /> Find alternatives</button>
+			<button class="sm danger" onclick={openRemove} title="Remove from the playlist on YouTube"><ListX size={14} /> Remove from YouTube</button>
+		{/if}
 		<button class="ghost icon sm" onclick={() => selected.clear()} title="Clear selection"><X size={15} /></button>
 	</div>
 {/if}
@@ -302,6 +343,26 @@
 <BulkEditor bind:open={bulkOpen} itemIds={ids} mode={bulkMode} onapplied={() => { load(); coverV = Date.now(); }} />
 <ItemEditor bind:itemId={editId} onchanged={() => load()} />
 
+{#if playlistId}
+	<AlternativesModal bind:open={altOpen} {playlistId} itemIds={altIds} {items} {filesFollowPlaylist} onchanged={() => { load(); onchanged?.(); }} />
+{/if}
+
+<Modal bind:open={confirmRemove} title="Remove {selected.size} track{selected.size === 1 ? '' : 's'} from YouTube?" width="480px">
+	<div class="warnbox">
+		<TriangleAlert size={16} />
+		<span>This removes the track{selected.size === 1 ? '' : 's'} from the <b>real playlist on YouTube</b>, not only from Tubekeep. Tubekeep can't undo it.</span>
+	</div>
+	{#if filesFollowPlaylist}
+		<p class="small muted" style="margin-top: 12px">This playlist deletes files of removed tracks, so downloaded files are deleted too.</p>
+	{:else}
+		<label class="check" style="margin-top: 12px"><input type="checkbox" bind:checked={removeFiles} /> Also delete the downloaded files</label>
+	{/if}
+	{#snippet footer()}
+		<button onclick={() => (confirmRemove = false)}>Cancel</button>
+		<button class="danger solid" onclick={removeFromYouTube} disabled={removing}>{#if removing}<Loader size={14} class="spin" />{/if} Remove from YouTube</button>
+	{/snippet}
+</Modal>
+
 <Modal bind:open={confirmDelete} title="Delete {selected.size} files?" width="440px">
 	<p>The audio files are deleted from disk and the tracks are marked as ignored, so the next sync does not download them again.</p>
 	{#snippet footer()}
@@ -311,6 +372,19 @@
 </Modal>
 
 <style>
+	.warnbox {
+		display: flex;
+		gap: 8px;
+		align-items: flex-start;
+		background: var(--warn-soft);
+		border-radius: 8px;
+		padding: 10px 12px;
+	}
+	.warnbox :global(svg) {
+		color: var(--warn);
+		flex-shrink: 0;
+		margin-top: 2px;
+	}
 	.toolbar {
 		display: flex;
 		flex-direction: column;

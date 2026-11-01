@@ -15,8 +15,7 @@ from .events import bus
 from .jobs import manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-VERSION = (Path(__file__).resolve().parent / "VERSION").read_text().strip() \
-    if (Path(__file__).resolve().parent / "VERSION").exists() else "dev"
+VERSION = config.VERSION
 
 
 @asynccontextmanager

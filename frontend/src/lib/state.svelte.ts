@@ -23,7 +23,8 @@ export type LiveJob = {
 export const session = $state({
 	ready: false,
 	setupNeeded: false,
-	user: null as null | { id: number; username: string }
+	user: null as null | { id: number; username: string },
+	version: ''
 });
 
 export const live = $state({

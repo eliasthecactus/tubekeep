@@ -194,6 +194,12 @@ MIGRATIONS: list[str] = [
     );
     ALTER TABLE jobs ADD COLUMN transfer_id INTEGER REFERENCES transfers(id) ON DELETE SET NULL;
     """,
+    # 0.2.0: can the linked account edit the YouTube playlist (cached)
+    """
+    ALTER TABLE playlists ADD COLUMN writable INTEGER;
+    ALTER TABLE playlists ADD COLUMN access_reason TEXT;
+    ALTER TABLE playlists ADD COLUMN access_checked_at REAL;
+    """,
 ]
 
 
