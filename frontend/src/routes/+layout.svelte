@@ -2,7 +2,7 @@
 	import '../app.css';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { LayoutDashboard, ListMusic, Library, Activity, ArrowLeftRight, UserRound, Shield, Settings, LogOut, Menu, Sun, Moon, Monitor } from '@lucide/svelte';
+	import { LayoutDashboard, ListMusic, Library, Copy, Activity, ArrowLeftRight, UserRound, Shield, Settings, LogOut, Menu, Sun, Moon, Monitor } from '@lucide/svelte';
 	import { get, post, setUnauthorizedHandler } from '#lib/api.ts';
 	import { session, live, connectEvents, disconnectEvents } from '#lib/state.svelte.ts';
 	import Toasts from '#lib/components/Toasts.svelte';
@@ -15,6 +15,7 @@
 		{ href: '/', label: 'Dashboard', icon: LayoutDashboard },
 		{ href: '/playlists', label: 'Playlists', icon: ListMusic },
 		{ href: '/library', label: 'Library', icon: Library },
+		{ href: '/duplicates', label: 'Duplicates', icon: Copy },
 		{ href: '/transfers', label: 'Transfers', icon: ArrowLeftRight },
 		{ href: '/activity', label: 'Activity', icon: Activity },
 		{ href: '/accounts', label: 'Accounts', icon: UserRound },

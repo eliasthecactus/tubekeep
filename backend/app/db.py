@@ -205,6 +205,14 @@ MIGRATIONS: list[str] = [
     ALTER TABLE playlists ADD COLUMN marker_seen INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE playlists ADD COLUMN storage_offline_at REAL;
     """,
+    # 0.2.2: duplicates: how often a video is in its YouTube playlist, groups marked as not duplicates
+    """
+    ALTER TABLE items ADD COLUMN copies INTEGER NOT NULL DEFAULT 1;
+    CREATE TABLE duplicate_dismissed (
+        key TEXT PRIMARY KEY,
+        created_at REAL NOT NULL
+    );
+    """,
 ]
 
 

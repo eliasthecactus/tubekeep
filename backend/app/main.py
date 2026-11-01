@@ -10,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from . import auth, config, db, scheduler, ytdlp
-from .api import auth_routes, metadata, playlists, system, transfers
+from .api import auth_routes, duplicates, metadata, playlists, system, transfers
 from .events import bus
 from .jobs import manager
 
@@ -75,6 +75,7 @@ app.include_router(playlists.router)   # before metadata: /items/ids must win ov
 app.include_router(metadata.router)
 app.include_router(system.router)
 app.include_router(transfers.router)
+app.include_router(duplicates.router)
 
 
 _static_cache: dict[str, tuple[bytes, str]] = {}

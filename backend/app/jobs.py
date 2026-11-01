@@ -324,6 +324,9 @@ class Manager:
         existing = {r["video_id"]: r for r in db.rows(
             "SELECT id, video_id, status, removed_at FROM items WHERE playlist_id = ?", [pl["id"]])}
         seen: set[str] = set()
+        copies: dict[str, int] = {}
+        for e in entries:
+            copies[e["id"]] = copies.get(e["id"], 0) + 1
         new = became_available = 0
         with db.tx() as c:
             for pos, e in enumerate(entries, 1):
@@ -348,9 +351,9 @@ class Manager:
                 ex = existing.get(vid)
                 if not ex:
                     new += 1
-                    c.execute("INSERT INTO items (playlist_id, video_id, position, status, first_seen_at, updated_at) "
-                              "VALUES (?, ?, ?, ?, ?, ?)",
-                              [pl["id"], vid, pos, "unavailable" if placeholder else "pending", now, now])
+                    c.execute("INSERT INTO items (playlist_id, video_id, position, status, first_seen_at, updated_at, "
+                              "copies) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                              [pl["id"], vid, pos, "unavailable" if placeholder else "pending", now, now, copies[vid]])
                 else:
                     status = ex["status"]
                     if status == "unavailable" and not placeholder:
@@ -359,8 +362,8 @@ class Manager:
                         status = "unavailable"
                     elif status == "deleted":
                         status = "pending"  # re-added after its file was deleted
-                    c.execute("UPDATE items SET position = ?, removed_at = NULL, status = ?, updated_at = ? "
-                              "WHERE id = ?", [pos, status, now, ex["id"]])
+                    c.execute("UPDATE items SET position = ?, removed_at = NULL, status = ?, updated_at = ?, copies = ? "
+                              "WHERE id = ?", [pos, status, now, copies[vid], ex["id"]])
             removed_ids = [r["id"] for v, r in existing.items() if v not in seen and r["removed_at"] is None]
             for rid in removed_ids:
                 c.execute("UPDATE items SET removed_at = ?, updated_at = ? WHERE id = ?", [now, now, rid])

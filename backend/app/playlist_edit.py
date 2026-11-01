@@ -93,7 +93,7 @@ async def _require_writable(pl: dict) -> YouTubeMusic:
 
 # ------------------------------------------------------------------ remove
 
-def _delete_file(item: dict) -> bool:
+def delete_item_file(item: dict) -> bool:
     path = item.get("file_path")
     if not path:
         return False
@@ -115,7 +115,7 @@ def _mark_removed(item: dict, delete_file: bool) -> bool:
     fields = {"removed_at": now, "updated_at": now}
     deleted = False
     if delete_file and item.get("file_path"):
-        deleted = _delete_file(item)
+        deleted = delete_item_file(item)
         if deleted:
             fields.update(status="deleted", file_path=None, file_size=None)
     db.update("items", item["id"], fields)
@@ -146,6 +146,91 @@ async def remove(pid: int, item_ids: list[int], delete_files: bool) -> dict:
     deleted = sum(_mark_removed(it, delete_files) for it in items)
     return {"removed": len(videos), "already_gone": len(items) - len({v["videoId"] for v in videos}),
             "deleted_files": deleted}
+
+
+async def remove_extra_copies(pid: int, item_ids: list[int]) -> dict:
+    """A video added several times to one YouTube playlist: keep its first entry, remove the others."""
+    pl = playlist(pid)
+    yt = await _require_writable(pl)
+    marks = ",".join("?" for _ in item_ids)
+    items = db.rows(f"SELECT * FROM items WHERE playlist_id = ? AND id IN ({marks})", [pid, *item_ids])
+    entries = await _entries_of(pl, yt, fresh=True)
+    extra, firsts = [], set()
+    wanted = {it["video_id"] for it in items}
+    for e in entries:
+        vid = e.get("videoId")
+        if vid in wanted and e.get("setVideoId"):
+            if vid in firsts:
+                extra.append({"videoId": vid, "setVideoId": e["setVideoId"]})
+            firsts.add(vid)
+    if extra:
+        ytid = yt_playlist_id(pl)
+        for i in range(0, len(extra), 100):
+            res = await yt._call(lambda c, b=extra[i:i + 100]: c.remove_playlist_items(ytid, b))
+            if isinstance(res, dict) or (isinstance(res, str) and "SUCCEEDED" not in res):
+                raise EditError(f"YouTube did not remove the tracks: {str(res)[:200]}")
+        _entries.pop(ytid, None)
+    for it in items:
+        db.update("items", it["id"], {"copies": 1, "updated_at": db.now()})
+    return {"removed": len(extra)}
+
+
+# ------------------------------------------------------------------ several playlists at once (library, duplicates)
+
+def syncing() -> set[int]:
+    return {j["playlist_id"] for j in manager.live() if j["type"] == "sync"}
+
+
+async def groups(item_ids: list[int]) -> list[dict]:
+    """The tracks grouped per playlist, with whether that playlist can be changed on YouTube."""
+    if not item_ids:
+        return []
+    marks = ",".join("?" for _ in item_ids)
+    rows = db.rows(f"SELECT i.id, i.playlist_id, p.title, p.url, p.on_removed FROM items i "
+                   f"JOIN playlists p ON p.id = i.playlist_id WHERE i.id IN ({marks}) ORDER BY i.playlist_id",
+                   item_ids)
+    out: dict[int, dict] = {}
+    for r in rows:
+        g = out.setdefault(r["playlist_id"], {"playlist_id": r["playlist_id"], "title": r["title"] or r["url"],
+                                              "files_follow": r["on_removed"] == "delete", "item_ids": []})
+        g["item_ids"].append(r["id"])
+    busy = syncing()
+    for g in out.values():
+        try:
+            a = await access(g["playlist_id"])
+            g["writable"], g["reason"] = a["writable"], a["reason"]
+        except (EditError, ProviderError) as e:
+            g["writable"], g["reason"] = False, str(e)
+        g["syncing"] = g["playlist_id"] in busy
+    return sorted(out.values(), key=lambda g: (not g["writable"], (g["title"] or "").lower()))
+
+
+async def remove_many(item_ids: list[int], delete_files: bool, extra_copies: bool = False) -> dict:
+    """Removes tracks of several playlists from YouTube (or, with extra_copies, only their repeated entries).
+    Read-only or syncing playlists are skipped and reported, not failed."""
+    out = {"removed": 0, "already_gone": 0, "deleted_files": 0, "playlists": 0, "skipped": []}
+    for g in await groups(item_ids):
+        reason = None
+        if not g["writable"]:
+            reason = g["reason"] or "Read-only"
+        elif g["playlist_id"] in syncing():
+            reason = "Wait until the sync of this playlist is finished"
+        else:
+            try:
+                if extra_copies:
+                    r = await remove_extra_copies(g["playlist_id"], g["item_ids"])
+                else:
+                    r = await remove(g["playlist_id"], g["item_ids"], delete_files)
+            except (EditError, ProviderError) as e:
+                reason = str(e)
+            else:
+                out["playlists"] += 1
+                for k in ("removed", "already_gone", "deleted_files"):
+                    out[k] += r.get(k, 0)
+        if reason:
+            out["skipped"].append({"playlist_id": g["playlist_id"], "title": g["title"],
+                                   "tracks": len(g["item_ids"]), "reason": reason})
+    return out
 
 
 # ------------------------------------------------------------------ alternatives
