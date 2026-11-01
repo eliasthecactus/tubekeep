@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .. import auth, db, library, playlist_edit, scheduler, settings_store
+from .. import auth, db, library, playlist_edit, scheduler, settings_store, storage
 from ..jobs import manager
 from ..providers.base import ProviderError
 
@@ -174,6 +174,8 @@ def patch_playlist(pid: int, body: PlaylistPatch):
         if move and p["folder"]:
             _move_files(pid, p["folder"], new)
     db.update("playlists", pid, fields)
+    if fields.get("folder"):
+        storage.write_marker(db.row("SELECT * FROM playlists WHERE id = ?", [pid]))
     return get_playlist(pid)
 
 
@@ -217,6 +219,7 @@ def delete_playlist(pid: int, delete_files: bool = False):
                 pass
         if p["folder"] and os.path.isdir(p["folder"]):
             try:
+                storage.marker_path(p["folder"]).unlink(missing_ok=True)
                 os.rmdir(p["folder"])  # only if empty
             except OSError:
                 pass
@@ -404,3 +407,48 @@ async def find_alternatives(pid: int, item_id: int, body: AlternativesIn):
 async def use_alternative(pid: int, item_id: int, body: AlternativeIn):
     return await _edit(pid, lambda: playlist_edit.apply_alternative(pid, item_id, body.candidate, body.replace,
                                                                     body.delete_file))
+
+
+# ------------------------------------------------------------------ folder marker missing
+
+class StorageIn(BaseModel):
+    action: str  # check | redownload | keep_missing
+    playlist_ids: list[int] | None = None
+
+
+def _storage_action(pl: dict, action: str) -> dict:
+    if action == "check":
+        ok = storage.check(pl)
+        if ok:
+            manager.enqueue("sync", pl["id"])
+        return {"id": pl["id"], "offline": not ok}
+    if action not in ("redownload", "keep_missing"):
+        raise HTTPException(400, "Unknown action")
+    try:
+        storage.write_marker(pl)
+    except OSError as e:
+        raise HTTPException(400, f"Cannot write to {pl['folder']}: {e}")
+    if action == "redownload":
+        db.execute("UPDATE items SET status = 'pending', error = NULL, attempts = 0 "
+                   "WHERE playlist_id = ? AND status = 'missing'", [pl["id"]])
+        manager.enqueue("sync", pl["id"], {"redownload": True})
+    else:
+        manager.enqueue("verify", pl["id"], {"redownload": False})
+    return {"id": pl["id"], "offline": False}
+
+
+@router.post("/playlists/{pid}/storage")
+def playlist_storage(pid: int, body: StorageIn):
+    pl = db.row("SELECT * FROM playlists WHERE id = ?", [pid])
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    return _storage_action(pl, body.action)
+
+
+@router.post("/storage/offline")
+def all_offline_storage(body: StorageIn):
+    """The same choice for several (default: all) playlists whose folder is missing."""
+    pls = db.rows("SELECT * FROM playlists WHERE storage_offline_at IS NOT NULL")
+    if body.playlist_ids is not None:
+        pls = [p for p in pls if p["id"] in set(body.playlist_ids)]
+    return {"results": [_storage_action(p, body.action) for p in pls]}

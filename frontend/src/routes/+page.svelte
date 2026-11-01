@@ -4,6 +4,7 @@
 	import { ago, bytes, until } from '#lib/format.ts';
 	import { errorToast, live, on, toast } from '#lib/state.svelte.ts';
 	import JobCard from '#lib/components/JobCard.svelte';
+	import StorageAlert from '#lib/components/StorageAlert.svelte';
 
 	let d = $state<any>(null);
 	let sys = $state<any>(null);
@@ -17,6 +18,13 @@
 	}
 	load();
 	$effect(() => on('job', (j) => ['done', 'failed', 'cancelled'].includes(j.status) && load()));
+	let soon: ReturnType<typeof setTimeout>;
+	$effect(() =>
+		on('playlist', () => {
+			clearTimeout(soon);
+			soon = setTimeout(load, 800);
+		})
+	);
 
 	async function syncAll() {
 		try {
@@ -40,6 +48,7 @@
 </div>
 
 {#if d}
+	{#if d.storage_offline?.length}<StorageAlert playlists={d.storage_offline} onchanged={load} />{/if}
 	{#each d.accounts_expired as a (a.id)}
 		<a href="/accounts" class="banner"><TriangleAlert size={16} /> Account <b>{a.label}</b> needs fresh cookies. Its playlists are skipped by the schedule.</a>
 	{/each}

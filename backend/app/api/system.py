@@ -368,6 +368,8 @@ def dashboard():
         "next_runs": db.rows("SELECT id, title, url, next_run_at FROM playlists WHERE enabled = 1 AND "
                              "next_run_at IS NOT NULL ORDER BY next_run_at LIMIT 5"),
         "accounts_expired": db.rows("SELECT id, label FROM accounts WHERE status = 'expired'"),
+        "storage_offline": db.rows("SELECT id, title, url, folder, storage_offline_at FROM playlists "
+                                   "WHERE storage_offline_at IS NOT NULL ORDER BY title COLLATE NOCASE"),
         "proxies": {"total": db.scalar("SELECT COUNT(*) FROM proxies"),
                     "usable": db.scalar("SELECT COUNT(*) FROM proxies WHERE enabled = 1 AND "
                                         "(cooldown_until IS NULL OR cooldown_until < ?)", [time.time()])},

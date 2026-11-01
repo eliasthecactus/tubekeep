@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Plus, RefreshCw, FileSearch, UserRound, Lock, Loader, Folder, Clock, Download } from '@lucide/svelte';
+	import { Plus, RefreshCw, FileSearch, UserRound, Lock, Loader, Folder, Clock, Download, HardDrive } from '@lucide/svelte';
 	import { get, post } from '#lib/api.ts';
 	import { ago, bytes, scheduleLabel, until } from '#lib/format.ts';
 	import { errorToast, jobForPlaylist, on, toast } from '#lib/state.svelte.ts';
@@ -151,6 +151,7 @@
 		<a class="pl card" href="/playlists/{p.id}">
 			<div class="row">
 				<h2 class="ellipsis grow" title={p.title ?? p.url}>{p.title ?? 'Not synced yet'}</h2>
+				{#if p.storage_offline_at}<span class="pill warn" title="The download folder is missing (drive not mounted?). Syncs are paused."><HardDrive size={11} /> folder missing</span>{/if}
 				{#if p.account_id}<span class="pill {p.account_status === 'expired' ? 'err' : ''}" title="Uses account {p.account_label}"><Lock size={11} /> {p.account_label}</span>{/if}
 			</div>
 			<div class="small faint ellipsis mono">{p.url.replace(/^https?:\/\/(www\.)?/, '')}</div>

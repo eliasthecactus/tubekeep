@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-from . import accounts, config, db, library, notify, proxies, settings_store, tags, transfers, ytdlp
+from . import accounts, config, db, library, notify, proxies, settings_store, storage, tags, transfers, ytdlp
 from .events import bus
 
 log = logging.getLogger("tubekeep.jobs")
@@ -18,6 +18,10 @@ ACTIVE_JOB = ("queued", "running")
 
 class JobError(Exception):
     pass
+
+
+class StorageOffline(JobError):
+    """The playlist folder lost its marker; the playlist page asks the user how to continue."""
 
 
 class Slots:
@@ -126,6 +130,7 @@ class Manager:
     def recover(self) -> None:
         """After a restart nothing is running: fix rows left in running states."""
         self.loop = asyncio.get_running_loop()
+        storage.loop = self.loop
         db.execute("UPDATE items SET status = 'pending' WHERE status IN ('queued', 'downloading')")
         # jobs that were waiting simply continue; jobs that were running start over
         waiting = db.rows("SELECT * FROM jobs WHERE status = 'queued' ORDER BY id")
@@ -216,7 +221,7 @@ class Manager:
         ctx = Ctx(job)
         self.ctx[job["id"]] = ctx
         params = db.jload(job["params"], {}) or {}
-        status, error = "done", None
+        status, error, quiet = "done", None, False
         try:
             async with self.job_slots, self.lock_for(job["playlist_id"], job.get("transfer_id")):
                 ctx.status = "running"
@@ -230,6 +235,7 @@ class Manager:
             ctx.log("Cancelled")
         except (JobError, transfers.TransferError) as e:
             status, error = "failed", str(e)
+            quiet = isinstance(e, StorageOffline)  # it sent its own notification once
             ctx.log(f"ERROR {e}")
         except Exception as e:  # unexpected
             status, error = "failed", f"{type(e).__name__}: {e}"
@@ -258,7 +264,7 @@ class Manager:
             bus.publish("job", {**final, "items": [], "phase": status})
             self.ctx.pop(job["id"], None)
             self.tasks.pop(job["id"], None)
-            if status == "failed" and job["trigger"] == "schedule":
+            if status == "failed" and job["trigger"] == "schedule" and not quiet:
                 asyncio.create_task(notify.send("Tubekeep: job failed", f"{job['title']}: {error}"))
 
     # ------------------------------------------------------------ helpers
@@ -269,6 +275,10 @@ class Manager:
             raise JobError("Playlist was deleted")
         pl["options"] = db.jload(pl["options"], {}) or {}
         return pl
+
+    async def _require_storage(self, pl: dict) -> None:
+        if not await asyncio.to_thread(storage.check, pl):
+            raise StorageOffline(storage.offline_message(pl))
 
     async def _enumerate(self, ctx: Ctx, pl: dict, acc: dict | None) -> dict:
         tried: set[int] = set()
@@ -572,6 +582,7 @@ class Manager:
     async def _sync(self, ctx: Ctx, job: dict, params: dict) -> None:
         pl = self._playlist(job["playlist_id"])
         acc = accounts.get(pl["account_id"])
+        await self._require_storage(pl)
         ctx.set_phase("fetching playlist")
         data = await self._enumerate(ctx, pl, acc)
         if not pl["folder"]:
@@ -579,15 +590,17 @@ class Manager:
                                              library.default_folder(data.get("title") or pl["url"]))
             db.update("playlists", pl["id"], {"folder": folder})
             ctx.log(f"Download folder: {folder}")
+            await asyncio.to_thread(storage.write_marker, pl, folder)
         await asyncio.to_thread(self._upsert, ctx, pl, data)
         pl = self._playlist(pl["id"])
         if pl["title"] and ctx.job["title"] != f"Sync {pl['title']}":
             ctx.job["title"] = f"Sync {pl['title']}"
             db.update("jobs", ctx.id, {"title": ctx.job["title"]})
         bus.publish("playlist", {"id": pl["id"]})
+        await self._require_storage(pl)  # the drive can go away while the playlist was fetched
         await asyncio.to_thread(library.check_folder, pl["folder"])
         ctx.set_phase("checking files")
-        await asyncio.to_thread(self._verify_files, ctx, pl)
+        await asyncio.to_thread(self._verify_files, ctx, pl, params.get("redownload"))
         await self._download_all(ctx, pl, acc, await asyncio.to_thread(self._todo, pl, acc))
         await asyncio.to_thread(self._handle_removed, ctx, pl)
         ctx.set_phase("finished")
@@ -605,6 +618,7 @@ class Manager:
         force = bool(params.get("force"))
         if not pl["folder"]:
             raise JobError("Playlist has no folder yet, run a sync first")
+        await self._require_storage(pl)
         for it in items:
             db.update("items", it["id"], {"attempts": 0})
         await self._download_all(ctx, pl, acc, items, force=force)
@@ -618,15 +632,25 @@ class Manager:
     async def _verify(self, ctx: Ctx, job: dict, params: dict) -> None:
         ids = [job["playlist_id"]] if job["playlist_id"] else \
             [r["id"] for r in db.rows("SELECT id FROM playlists WHERE folder IS NOT NULL")]
+        redownload = params.get("redownload")
+        offline = []
         for pid in ids:
             pl = self._playlist(pid)
             if not pl["folder"]:
                 continue
+            if not await asyncio.to_thread(storage.check, pl):
+                offline.append(pl["title"] or pl["url"])
+                ctx.log(f"Skipped {pl['title'] or pl['url']}: folder marker missing in {pl['folder']}")
+                continue
             ctx.log(f"Checking {pl['title'] or pl['url']}")
             ctx.set_phase("checking files")
             # verify never downloads; missing files get 'pending' so the next sync fetches them
-            await asyncio.to_thread(self._verify_files, ctx, pl)
+            await asyncio.to_thread(self._verify_files, ctx, pl, redownload)
             bus.publish("playlist", {"id": pid})
+        if offline and job["playlist_id"]:
+            raise StorageOffline(storage.offline_message(self._playlist(job["playlist_id"])))
+        if offline:
+            ctx.inc("offline", len(offline))
         ctx.set_phase("finished")
 
 

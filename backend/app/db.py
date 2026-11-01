@@ -200,6 +200,11 @@ MIGRATIONS: list[str] = [
     ALTER TABLE playlists ADD COLUMN access_reason TEXT;
     ALTER TABLE playlists ADD COLUMN access_checked_at REAL;
     """,
+    # 0.2.1: folder marker (.tubekeep) to notice unmounted drives
+    """
+    ALTER TABLE playlists ADD COLUMN marker_seen INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE playlists ADD COLUMN storage_offline_at REAL;
+    """,
 ]
 
 

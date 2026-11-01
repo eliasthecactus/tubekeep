@@ -58,6 +58,7 @@ export type Playlist = {
 	last_sync_status: string | null;
 	last_error: string | null;
 	next_run_at: number | null;
+	storage_offline_at: number | null;
 	counts: Record<string, number>;
 	bytes?: number;
 	job?: any;

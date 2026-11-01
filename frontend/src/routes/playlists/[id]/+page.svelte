@@ -12,6 +12,7 @@
 	import PlaylistForm from '#lib/components/PlaylistForm.svelte';
 	import Segments from '#lib/components/Segments.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
+	import StorageAlert from '#lib/components/StorageAlert.svelte';
 
 	const id = $derived(Number(page.params.id));
 	let p = $state<Playlist | null>(null);
@@ -136,6 +137,8 @@
 		<button class="primary" onclick={sync} disabled={!!job}><RefreshCw size={15} class={job ? 'spin' : ''} /> {job ? 'Syncing…' : 'Sync now'}</button>
 	</div>
 
+	{#if p.storage_offline_at}<StorageAlert playlists={[p]} onchanged={load} />{/if}
+
 	<div class="summary card pad">
 		<Segments counts={p.counts} height={8} />
 		<div class="row wrap small" style="gap: 16px; margin-top: 10px">
@@ -150,7 +153,7 @@
 			<span class="muted">last sync {ago(p.last_sync_at)}</span>
 			{#if p.last_sync_status}<StatusBadge status={p.last_sync_status} />{/if}
 		</div>
-		{#if p.last_error}<div class="lasterr small">{p.last_error}</div>{/if}
+		{#if p.last_error && !p.storage_offline_at}<div class="lasterr small">{p.last_error}</div>{/if}
 	</div>
 
 	{#if job}<JobCard {job} />{/if}
