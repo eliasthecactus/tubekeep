@@ -18,7 +18,9 @@
 		url: string;
 		score: number | null;
 		in_playlist: boolean;
+		available: boolean;
 	};
+	type Link = { kind: 'song' | 'video' | 'album' | 'playlist' | 'artist'; title: string | null; count: number };
 	type Row = {
 		id: number;
 		group: EditGroup;
@@ -26,6 +28,7 @@
 		query: string;
 		source: { title: string; artists: string[]; duration: number | null; known: boolean } | null;
 		cands: Cand[];
+		link: Link | null;
 		loading: boolean;
 		error: string;
 		done: string;
@@ -62,7 +65,7 @@
 	});
 	function start() {
 		const all = groups.flatMap((group) => group.item_ids.map((id) => ({ id, group })));
-		rows = all.slice(0, MAX).map(({ id, group }) => ({ id, group, item: items.find((i) => i.id === id), query: '', source: null, cands: [], loading: true, error: '', done: '', busy: '' }));
+		rows = all.slice(0, MAX).map(({ id, group }) => ({ id, group, item: items.find((i) => i.id === id), query: '', source: null, cands: [], link: null, loading: true, error: '', done: '', busy: '' }));
 		deleteOld = false;
 		// two searches at a time, YouTube doesn't like bursts
 		let next = 0;
@@ -81,9 +84,12 @@
 			row.source = r.source;
 			row.query = r.query;
 			row.cands = r.candidates;
+			row.link = r.link ?? null;
 			if (!r.query) row.error = "Tubekeep doesn't know what this video was. Type a search below.";
 		} catch (e: any) {
 			row.error = e.message;
+			row.cands = [];
+			row.link = null;
 		} finally {
 			row.loading = false;
 		}
@@ -109,6 +115,7 @@
 		const artists = row.source?.artists?.join(', ') || m?.artist || row.item?.channel || '';
 		return { title, artists };
 	}
+	const LINK_KIND = { song: 'Song', video: 'Video', album: 'Album', playlist: 'Playlist', artist: 'Songs of' };
 	function scoreKind(s: number | null) {
 		if (s == null) return '';
 		return s >= 0.85 ? 'ok' : s >= 0.6 ? 'warn' : '';
@@ -155,14 +162,17 @@
 				</div>
 				{#if !row.done}
 					<form class="q" onsubmit={(e) => { e.preventDefault(); search(row, row.query); }}>
-						<input bind:value={row.query} placeholder="Search YouTube Music…" />
+						<input bind:value={row.query} placeholder="Search YouTube Music or paste a link…" />
 						<button type="submit" class="sm" disabled={row.loading || !row.query.trim()}>
 							{#if row.loading}<Loader size={14} class="spin" />{:else}<Search size={14} />{/if} Search
 						</button>
 					</form>
 					{#if row.error}<div class="small errtext">{row.error}</div>{/if}
-					{#if !row.loading && !row.error && !row.cands.length}<div class="small muted">Nothing found. Try another search.</div>{/if}
-					<ul>
+					{#if row.link}
+						<div class="small muted ellipsis">{LINK_KIND[row.link.kind]} <b>{row.link.title || 'from the link'}</b>{row.link.kind === 'song' || row.link.kind === 'video' ? '' : ` · ${row.link.count} track${row.link.count === 1 ? '' : 's'}`}</div>
+					{/if}
+					{#if !row.loading && !row.error && !row.cands.length}<div class="small muted">{row.link ? 'Nothing in this link to pick.' : 'Nothing found. Try another search or paste a YouTube link.'}</div>{/if}
+					<ul class:long={row.cands.length > 8}>
 						{#each row.cands as c, i (c.video_id)}
 							<li>
 								<div class="thumb sm">{#if c.thumbnail}<img src={c.thumbnail} alt="" loading="lazy" />{:else}<Music size={14} />{/if}</div>
@@ -172,12 +182,13 @@
 								</div>
 								<span class="small muted nowrap hide-sm">{duration(c.duration)}{diff(c.duration, row.source?.duration)}</span>
 								{#if c.score != null}<span class="pill {scoreKind(c.score)}" title="How well it matches">{Math.round(c.score * 100)}%</span>{/if}
+								{#if !c.available}<span class="pill err" title="YouTube says this video can't be played">unavailable</span>{/if}
 								{#if c.in_playlist}<span class="pill info" title="This video is already in the playlist">in playlist</span>{/if}
 								<a class="ghost icon sm btnlike" href={c.url} target="_blank" rel="noreferrer" title="Open on YouTube Music"><ExternalLink size={14} /></a>
-								<button class="sm" disabled={!!row.busy} onclick={() => apply(row, c, false)} title="Add to the playlist, keep the old entry">
+								<button class="sm" disabled={!!row.busy || !c.available} onclick={() => apply(row, c, false)} title="Add to the playlist, keep the old entry">
 									{#if row.busy === c.video_id + ':a'}<Loader size={14} class="spin" />{:else}<Plus size={14} />{/if} Add
 								</button>
-								<button class="sm" class:primary={i === 0} disabled={!!row.busy} onclick={() => apply(row, c, true)} title="Put it in place of the old entry and remove the old one">
+								<button class="sm" class:primary={i === 0 && c.available} disabled={!!row.busy || !c.available} onclick={() => apply(row, c, true)} title="Put it in place of the old entry and remove the old one">
 									{#if row.busy === c.video_id + ':r'}<Loader size={14} class="spin" />{:else}<Replace size={14} />{/if} Replace
 								</button>
 							</li>
@@ -231,6 +242,11 @@
 	.q {
 		display: flex;
 		gap: 6px;
+	}
+	ul.long {
+		max-height: 420px;
+		overflow-y: auto;
+		padding-right: 4px;
 	}
 	ul {
 		list-style: none;

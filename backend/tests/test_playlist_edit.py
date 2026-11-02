@@ -38,7 +38,41 @@ class FakeYTMusic:
         return {"videoId": vid, "setVideoId": f"set{self.n}" if self.owned else None, "title": title,
                 "artists": [{"name": artist}] if artist else [], "isAvailable": available}
 
+    others: dict = {
+        "PLother": {"title": "Someone's mix", "tracks": [
+            {"videoId": "mixsong0001", "title": "Mix Song", "artists": [{"name": "DJ"}], "duration_seconds": 200,
+             "thumbnails": [{"url": "https://img/mix.jpg"}]},
+            {"videoId": "mixdead0001", "title": "Gone Song", "artists": [{"name": "DJ"}], "isAvailable": False}]},
+        "OLAK5uy_album1": {"title": "Discovery", "thumbnails": [{"url": "https://img/disc.jpg"}], "tracks": [
+            {"videoId": "onemoretim1", "title": "One More Time", "artists": [{"name": "Daft Punk"}],
+             "duration_seconds": 320}]},
+        "OLAK5uy_allsongs": {"title": "Songs", "tracks": [
+            {"videoId": "wonderwall1", "title": "Wonderwall", "artists": [{"name": "Oasis"}], "duration_seconds": 258,
+             "thumbnails": [{"url": "https://img/ww.jpg"}]}]},
+    }
+
+    def get_song(self, vid):
+        known = {c["videoId"]: c for c in self.catalog}
+        if vid not in known and vid != "deadsong001":
+            return {"playabilityStatus": {"status": "ERROR"}}
+        c = known.get(vid) or {"title": "Dead Song", "artists": [{"name": "Nobody"}], "duration_seconds": 100}
+        return {"playabilityStatus": {"status": "OK" if vid in known else "UNPLAYABLE"},
+                "videoDetails": {"videoId": vid, "title": c["title"], "author": c["artists"][0]["name"],
+                                 "lengthSeconds": str(c["duration_seconds"]), "musicVideoType": "MUSIC_VIDEO_TYPE_ATV",
+                                 "thumbnail": {"thumbnails": [{"url": f"https://img/{vid}.jpg"}]}}}
+
+    def get_album(self, browse_id):
+        if browse_id != "MPREb_disc":
+            raise Exception("Unable to find 'contents'")
+        a = copy.deepcopy(self.others["OLAK5uy_album1"])
+        return {"title": a["title"], "thumbnails": a["thumbnails"], "tracks": a["tracks"]}
+
+    def get_artist(self, channel_id):
+        return {"name": "Oasis", "songs": {"browseId": "VLOLAK5uy_allsongs", "results": []}}
+
     def get_playlist(self, pid, limit=100):
+        if pid in self.others:
+            return {"id": pid, "owned": False, **copy.deepcopy(self.others[pid])}
         tracks = copy.deepcopy(self.tracks)
         if not self.owned:
             for t in tracks:
@@ -243,6 +277,78 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert a["writable"] is False
     r = client.post(f"/api/playlists/{pid}/remove", json={"item_ids": [its["keepsong001"]["id"]]}, headers=H)
     assert r.status_code == 400 and "can't edit" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("https://music.youtube.com/watch?v=OrsOmOVycwI&si=abc", ("song", "OrsOmOVycwI")),
+    ("https://www.youtube.com/watch?v=56eNheFJHC8&list=RD56eNheFJHC8", ("song", "56eNheFJHC8")),
+    ("https://youtu.be/56eNheFJHC8?t=3", ("song", "56eNheFJHC8")),
+    ("youtube.com/shorts/56eNheFJHC8", ("song", "56eNheFJHC8")),
+    ("https://m.youtube.com/watch?v=56eNheFJHC8", ("song", "56eNheFJHC8")),
+    ("https://music.youtube.com/playlist?list=OLAK5uy_lD91360", ("playlist", "OLAK5uy_lD91360")),
+    ("https://www.youtube.com/playlist?list=PLJgRR-Dwn", ("playlist", "PLJgRR-Dwn")),
+    ("https://music.youtube.com/browse/MPREb_tUR7PGu0mpB", ("album", "MPREb_tUR7PGu0mpB")),
+    ("https://music.youtube.com/browse/VLPLabc", ("playlist", "PLabc")),
+    ("https://music.youtube.com/channel/UCOzAJaDMM3OyqXXjLTlB4bg", ("artist", "UCOzAJaDMM3OyqXXjLTlB4bg")),
+    ("https://www.youtube.com/@TheDoDo", ("unknown", "https://www.youtube.com/@TheDoDo")),
+    ("TheDoDo Endorphine", None),
+    ("youtube music endorphine", None),
+    ("https://example.com/watch?v=56eNheFJHC8", None),
+])
+def test_parse_link(text, expected):
+    assert playlist_edit.parse_link(text) == expected
+
+
+def test_alternatives_from_a_pasted_link(client, fake_yt, yt):
+    ents = [{"id": "deadlink001", "title": "[Deleted video]", "channel": None, "duration": None}]
+    (fake_yt / "playlist.json").write_text(json.dumps({"_type": "playlist", "id": "PLlinks", "title": "Links",
+                                                        "entries": ents}))
+    pid = client.post("/api/playlists", json={"url": "https://www.youtube.com/playlist?list=PLlinks"},
+                      headers=H).json()["created"][0]
+    wait_jobs(client)
+    acc = db.insert("accounts", {"label": "links", "cookies_enc": crypto.encrypt(COOKIES), "status": "valid",
+                                 "cookies_updated_at": db.now(), "created_at": db.now()})
+    client.patch(f"/api/playlists/{pid}", json={"account_id": acc}, headers=H)
+    yt.tracks = [yt.entry("deadlink001", "Wonderwall", "Oasis", available=False)]
+    iid = items(client, pid)["deadlink001"]["id"]
+
+    def alt(q):
+        return client.post(f"/api/playlists/{pid}/items/{iid}/alternatives", json={"query": q}, headers=H)
+
+    # exactly the linked song
+    r = alt("https://music.youtube.com/watch?v=wonderwall1&si=x").json()
+    assert r["link"] == {"kind": "song", "title": "Wonderwall", "count": 1}
+    assert [c["video_id"] for c in r["candidates"]] == ["wonderwall1"] and r["candidates"][0]["available"]
+    # a dead video is listed but can't be picked
+    r = alt("https://youtu.be/deadsong001").json()
+    assert r["candidates"][0]["available"] is False
+    bad = client.post(f"/api/playlists/{pid}/items/{iid}/alternative",
+                      json={"candidate": r["candidates"][0], "replace": True}, headers=H)
+    assert bad.status_code == 400 and "can't be played" in bad.json()["detail"]
+    # album (browse id and OLAK list): tracks get the album cover and name
+    for link in ("https://music.youtube.com/browse/MPREb_disc", "https://music.youtube.com/playlist?list=OLAK5uy_album1"):
+        r = alt(link).json()
+        assert r["link"]["kind"] == "album" and r["link"]["title"] == "Discovery"
+        c = r["candidates"][0]
+        assert c["video_id"] == "onemoretim1" and c["thumbnail"] == "https://img/disc.jpg" and c["album"] == "Discovery"
+    # playlist in its own order, unavailable entries marked
+    r = alt("https://www.youtube.com/playlist?list=PLother").json()
+    assert r["link"] == {"kind": "playlist", "title": "Someone's mix", "count": 2}
+    assert [(c["video_id"], c["available"]) for c in r["candidates"]] == [("mixsong0001", True), ("mixdead0001", False)]
+    # artist: all their songs
+    r = alt("https://music.youtube.com/channel/UCoasis000000000000000").json()
+    assert r["link"]["kind"] == "artist" and r["candidates"][0]["video_id"] == "wonderwall1"
+    # links Tubekeep can't read
+    assert "@name" in alt("https://www.youtube.com/@oasis").json()["detail"]
+    assert "can't read this link" in alt("https://www.youtube.com/feed/history").json()["detail"]
+    assert "couldn't open this link" in alt("https://music.youtube.com/browse/MPREb_nothing").json()["detail"]
+
+    # a song picked from a link replaces the dead one like any search result
+    pick = alt("https://www.youtube.com/playlist?list=PLother").json()["candidates"][0]
+    r = client.post(f"/api/playlists/{pid}/items/{iid}/alternative", json={"candidate": pick, "replace": True},
+                    headers=H).json()
+    assert r["replaced"] is True and [t["videoId"] for t in yt.tracks] == ["mixsong0001"]
+    wait_jobs(client)
 
 
 def test_library_edits_across_playlists(client, fake_yt, yt):

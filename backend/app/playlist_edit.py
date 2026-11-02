@@ -6,12 +6,13 @@ that account can edit (its own, or collaborative ones) are writable.
 import os
 import re
 import time
+from urllib.parse import parse_qs, urlparse
 
 from . import accounts, db
 from .jobs import PLACEHOLDER_TITLES, item_event, manager
 from .matching import score
-from .providers.base import ProviderError
-from .providers.youtube import YouTubeMusic
+from .providers.base import AuthError, ProviderError
+from .providers.youtube import YouTubeMusic, _to_track
 
 ACCESS_TTL = 6 * 3600
 ENTRIES_TTL = 300
@@ -291,7 +292,102 @@ def _candidate(t: dict, src: dict, in_playlist: set[str]) -> dict:
     return {"video_id": t["id"], "title": t["title"], "artists": t["artists"], "album": t["album"],
             "duration": t["duration"], "thumbnail": t["extra"].get("thumbnail"),
             "kind": t["extra"].get("resultType") or "song", "url": f"https://music.youtube.com/watch?v={t['id']}",
-            "score": score(src, t) if src["title"] else None, "in_playlist": t["id"] in in_playlist}
+            "score": score(src, t) if src["title"] else None, "in_playlist": t["id"] in in_playlist,
+            "available": t["extra"].get("available", True)}
+
+
+# ------------------------------------------------------------------ links pasted into the alternatives search
+
+LINK_MAX = 300
+_LINK = re.compile(r"^(https?://)?([\w-]+\.)*(youtube\.com|youtu\.be|youtube-nocookie\.com)(/|$)", re.I)
+_VID = re.compile(r"[\w-]{11}")
+
+
+def parse_link(text: str) -> tuple[str, str] | None:
+    """A YouTube or YouTube Music link -> (kind, id): song, playlist (also albums' OLAK5uy_ lists), album
+    (MPREb_ browse ids) or artist (UC channel ids). ('unknown', link) for other YouTube links, None for search text."""
+    t = (text or "").strip()
+    if not _LINK.match(t) or " " in t:
+        return None
+    u = urlparse(t if re.match(r"^https?://", t, re.I) else "https://" + t)
+    host, path, qs = (u.hostname or "").lower(), u.path, parse_qs(u.query)
+    vid = (qs.get("v") or [None])[0]
+    if host.endswith("youtu.be"):
+        vid = path.strip("/").split("/")[0] or None
+    if m := re.match(r"^/(shorts|live|embed|v)/([\w-]{11})", path):
+        vid = m.group(2)
+    if vid and _VID.fullmatch(vid):
+        return "song", vid  # a song opened from an album or mix also carries list=, the song is what was shared
+    if lst := (qs.get("list") or [None])[0]:
+        return "playlist", lst
+    if m := re.match(r"^/browse/([\w-]+)", path):
+        b = m.group(1)
+        if b.startswith("MPREb_"):
+            return "album", b
+        if b.startswith("VL"):
+            return "playlist", b[2:]
+        if b.startswith("UC"):
+            return "artist", b
+    if m := re.match(r"^/channel/(UC[\w-]+)", path):
+        return "artist", m.group(1)
+    return "unknown", t
+
+
+def _thumb(thumbs: list[dict] | None) -> str | None:
+    return thumbs[-1].get("url") if thumbs else None
+
+
+def _listed(items: list[dict], cover: list[dict] | None = None, album: str | None = None) -> list[dict]:
+    out = []
+    for it in items:
+        it = dict(it)
+        if cover and not it.get("thumbnails"):
+            it["thumbnails"] = cover  # album tracks come without their own cover
+        if album and not it.get("album"):
+            it["album"] = {"name": album}
+        if t := _to_track(it):
+            t["extra"]["available"] = it.get("isAvailable", True) is not False
+            out.append(t)
+    return out
+
+
+async def link_tracks(yt: YouTubeMusic, kind: str, ident: str) -> tuple[dict, list[dict]]:
+    """What a pasted link points to ({kind, title}) and its songs, in the link's own order."""
+    try:
+        if kind == "song":
+            d = await yt._call(lambda c: c.get_song(ident))
+            vd = d.get("videoDetails") or {}
+            if not vd.get("videoId"):
+                raise EditError("YouTube doesn't know this video")
+            playable = (d.get("playabilityStatus") or {}).get("status") == "OK"
+            song = vd.get("musicVideoType") == "MUSIC_VIDEO_TYPE_ATV"
+            t = _to_track({"videoId": vd["videoId"], "title": vd.get("title"),
+                           "artists": [{"name": vd["author"]}] if vd.get("author") else [],
+                           "duration_seconds": int(vd.get("lengthSeconds") or 0) or None,
+                           "thumbnails": (vd.get("thumbnail") or {}).get("thumbnails") or [],
+                           "resultType": "song" if song else "video"})
+            t["extra"]["available"] = playable
+            return {"kind": "song" if song else "video", "title": vd.get("title")}, [t]
+        if kind == "album":
+            a = await yt._call(lambda c: c.get_album(ident))
+            return {"kind": "album", "title": a.get("title")}, _listed(a.get("tracks") or [], a.get("thumbnails"),
+                                                                       a.get("title"))
+        if kind == "artist":
+            a = await yt._call(lambda c: c.get_artist(ident))
+            songs = a.get("songs") or {}
+            info = {"kind": "artist", "title": a.get("name")}
+            if songs.get("browseId"):  # the artist's full song list is a playlist
+                p = await yt._call(lambda c: c.get_playlist(songs["browseId"].removeprefix("VL"), limit=LINK_MAX))
+                return info, _listed(p.get("tracks") or [])
+            return info, _listed(songs.get("results") or [])
+        p = await yt._call(lambda c: c.get_playlist(ident, limit=LINK_MAX))
+        album = ident.startswith("OLAK5uy_")
+        return ({"kind": "album" if album else "playlist", "title": p.get("title")},
+                _listed(p.get("tracks") or [], p.get("thumbnails") if album else None, p.get("title") if album else None))
+    except AuthError:
+        raise
+    except ProviderError:
+        raise EditError("YouTube Music couldn't open this link. It may be private, deleted or not available here.")
 
 
 async def alternatives(pid: int, item_id: int, query: str | None = None) -> dict:
@@ -309,9 +405,19 @@ async def alternatives(pid: int, item_id: int, query: str | None = None) -> dict
     q = (query or "").strip() or f"{' '.join(src['artists'][:2])} {src['title']}".strip()
     if not q:
         return {"source": src, "query": "", "candidates": []}
-    found = await yt.search(q, limit=10)
     in_playlist = {r["video_id"] for r in db.rows("SELECT video_id FROM items WHERE playlist_id = ? "
                                                     "AND removed_at IS NULL", [pid])}
+    if link := parse_link(q):
+        kind, ident = link
+        if kind == "unknown":
+            if "/@" in ident:
+                raise EditError("Channel links with @name can't be read. Open the artist on YouTube Music and "
+                                "copy that link (music.youtube.com/channel/…).")
+            raise EditError("Tubekeep can't read this link. Paste a link to a song, video, album, playlist or artist.")
+        info, found = await link_tracks(yt, kind, ident)
+        cands = [_candidate(t, src, in_playlist) for t in found if t["id"] != item["video_id"]][:LINK_MAX]
+        return {"source": src, "query": q, "link": info | {"count": len(cands)}, "candidates": cands}
+    found = await yt.search(q, limit=10)
     seen, cands = {item["video_id"]}, []
     for t in found:
         if t["id"] in seen:
@@ -334,6 +440,8 @@ async def apply_alternative(pid: int, item_id: int, cand: dict, replace: bool, d
     vid = cand.get("video_id") or ""
     if not re.fullmatch(r"[\w-]{11}", vid):
         raise EditError("Not a YouTube video id")
+    if cand.get("available") is False:
+        raise EditError("YouTube says this video can't be played, pick another one")
     ytid = yt_playlist_id(pl)
     entries = await _entries_of(pl, yt, fresh=True)
     old_entry = next((e for e in entries if e.get("videoId") == old["video_id"] and e.get("setVideoId")), None)
