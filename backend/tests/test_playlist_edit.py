@@ -23,6 +23,10 @@ class FakeYTMusic:
         self.n = 0
         self.removed_by_id: list[str] = []
         self.on_remove_by_id = None  # what youtube.com does with it: the test drops them from the yt-dlp listing
+        self.lose_adds = 0  # the next n adds answer "succeeded" but never show up, like YouTube sometimes does
+        self.stale_reads = 0  # the next n reads after an add still show the playlist from before it
+        self.adds: list[tuple[str, bool]] = []
+        self._before_add: list[dict] | None = None
         self.catalog = [
             self.song("onemoretim1", "One More Time", "Daft Punk", 320),
             self.song("onemorelive", "One More Time (Live)", "Daft Punk", 400),
@@ -76,6 +80,9 @@ class FakeYTMusic:
         if pid in self.others:
             return {"id": pid, "owned": False, **copy.deepcopy(self.others[pid])}
         tracks = copy.deepcopy(self.tracks)
+        if self.stale_reads and self._before_add is not None:
+            self.stale_reads -= 1
+            tracks = copy.deepcopy(self._before_add)
         if not self.owned:
             for t in tracks:
                 t.pop("setVideoId", None)
@@ -96,8 +103,16 @@ class FakeYTMusic:
         return {"status": "STATUS_SUCCEEDED"}
 
     def add_playlist_items(self, pid, ids, duplicates=False):
+        self.adds += [(vid, duplicates) for vid in ids]
+        self._before_add = copy.deepcopy(self.tracks)
         out = []
+        if self.lose_adds:
+            self.lose_adds -= 1
+            return {"status": "STATUS_SUCCEEDED", "playlistEditResults": [{"videoId": v, "setVideoId": "lost"}
+                                                                          for v in ids]}
         for vid in ids:
+            if not duplicates and any(t["videoId"] == vid for t in self.tracks):
+                continue
             e = self.entry(vid, next((c["title"] for c in self.catalog if c["videoId"] == vid), vid))
             self.tracks.append(e)
             out.append({"videoId": vid, "setVideoId": e["setVideoId"]})
@@ -133,6 +148,7 @@ def yt(monkeypatch):
     fake = FakeYTMusic()
     monkeypatch.setattr(YouTubeMusic, "_client", lambda self: fake)
     monkeypatch.setattr(playlist_edit, "RECHECK_DELAY", 0)
+    monkeypatch.setattr(playlist_edit, "EDIT_WAITS", (0, 0, 0, 0, 0))
     playlist_edit._entries.clear()
     return fake
 
@@ -255,17 +271,17 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert not items(client, pid)["deadvideo01"]["removed_at"]
     wait_jobs(client)
 
-    # YouTube says "succeeded" but the track isn't in the playlist: an error, and Tubekeep changes nothing
-    real_add = yt.add_playlist_items
-    yt.add_playlist_items = lambda pid_, ids, duplicates=False: {"status": "STATUS_SUCCEEDED",
-                                                                 "playlistEditResults": []}
-    before = items(client, pid)
+    # YouTube keeps saying "succeeded" but the track never shows up: an error, and neither YouTube's playlist
+    # nor Tubekeep lose the old track
+    yt.lose_adds = 2
+    before, yt_before = items(client, pid), [t["videoId"] for t in yt.tracks]
     cand = {"video_id": "wondercover", "title": "Wonderwall (Cover)", "artists": ["Someone"], "kind": "song"}
     r = client.post(f"/api/playlists/{pid}/items/{its['deadvideo01']['id']}/alternative",
                     json={"candidate": cand, "replace": True}, headers=H)
     assert r.status_code == 400 and "isn't in the playlist" in r.json()["detail"]
+    assert "old track was left" in r.json()["detail"]
+    assert [t["videoId"] for t in yt.tracks] == yt_before
     assert items(client, pid).keys() == before.keys() and not items(client, pid)["deadvideo01"]["removed_at"]
-    yt.add_playlist_items = real_add
 
     # a track removed on YouTube by someone else keeps its file; Forget drops it from Tubekeep, file stays
     keep_path = Path(items(client, pid)["keepsong001"]["file_path"])
@@ -487,3 +503,43 @@ def test_files_in_folder_not_on_youtube(client, fake_yt):
     assert Path(its["stayssong01"]["file_path"]).exists()
     assert set(items(client, pid)) == {"stayssong01"}
     assert client.get(f"/api/playlists/{pid}/extra-files").json() == []
+
+
+def test_replace_waits_for_youtube_and_adds_again_when_it_lost_the_track(client, fake_yt, yt):
+    ents = [{"id": "firstsong01", "title": "First", "channel": "Chan", "duration": 100},
+            {"id": "deadrepl001", "title": "[Deleted video]", "channel": None, "duration": None},
+            {"id": "lastsong001", "title": "Last", "channel": "Chan", "duration": 100}]
+    (fake_yt / "playlist.json").write_text(json.dumps({"_type": "playlist", "id": "PLlag", "title": "Lag",
+                                                        "entries": ents}))
+    pid = client.post("/api/playlists", json={"url": "https://www.youtube.com/playlist?list=PLlag"},
+                      headers=H).json()["created"][0]
+    wait_jobs(client)
+    acc = db.insert("accounts", {"label": "lag", "cookies_enc": crypto.encrypt(COOKIES), "status": "valid",
+                                 "cookies_updated_at": db.now(), "created_at": db.now()})
+    client.patch(f"/api/playlists/{pid}", json={"account_id": acc}, headers=H)
+    yt.tracks = [yt.entry("firstsong01", "First"), yt.entry("deadrepl001", "Wonderwall", "Oasis", available=False),
+                 yt.entry("lastsong001", "Last")]
+    iid = items(client, pid)["deadrepl001"]["id"]
+    cand = {"video_id": "wonderwall1", "title": "Wonderwall", "artists": ["Oasis"], "kind": "song"}
+
+    def replace():
+        return client.post(f"/api/playlists/{pid}/items/{iid}/alternative",
+                           json={"candidate": cand, "replace": True}, headers=H)
+
+    # YouTube shows the added track only a few reads later: Tubekeep waits instead of failing
+    yt.stale_reads = 3
+    r = replace()
+    assert r.status_code == 200 and r.json()["replaced"] is True
+    assert [t["videoId"] for t in yt.tracks] == ["firstsong01", "wonderwall1", "lastsong001"]
+    assert yt.adds == [("wonderwall1", True)]
+
+    # YouTube loses the first add: the old track stays until a second add (without duplicates) shows up
+    yt.adds.clear()
+    yt.lose_adds = 1
+    iid = items(client, pid)["wonderwall1"]["id"]
+    cand = {"video_id": "wondercover", "title": "Wonderwall (Cover)", "artists": ["Someone"], "kind": "song"}
+    r = replace()
+    assert r.status_code == 200, r.json()
+    assert yt.adds == [("wondercover", True), ("wondercover", False)]
+    assert [t["videoId"] for t in yt.tracks] == ["firstsong01", "wondercover", "lastsong001"]
+    assert not items(client, pid)["wondercover"]["removed_at"]

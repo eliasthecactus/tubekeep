@@ -19,6 +19,9 @@ from .providers.youtube import YouTubeMusic, _to_track
 ACCESS_TTL = 6 * 3600
 ENTRIES_TTL = 300
 RECHECK_DELAY = 5  # youtube.com can take a moment to show an edit made on YouTube Music
+# re-reads after an edit, in seconds: YouTube Music's "succeeded" can come before the playlist shows the change,
+# and an edit sent right after another one can make YouTube drop the first
+EDIT_WAITS = (0, 1, 2, 3, 4)
 _entries: dict[str, tuple[float, list[dict]]] = {}
 
 
@@ -117,6 +120,19 @@ async def youtube_music_ids(pl: dict) -> set[str] | None:
     return {e["videoId"] for e in entries if e.get("videoId")}
 
 
+async def _settled(pl: dict, yt: YouTubeMusic, done) -> tuple[bool, list[dict]]:
+    """Re-reads the playlist until done(entries) holds or the waits run out. Returns whether it held and the
+    last entries read."""
+    entries: list[dict] = []
+    for wait in EDIT_WAITS:
+        if wait:
+            await asyncio.sleep(wait)
+        entries = await _entries_of(pl, yt, fresh=True)
+        if done(entries):
+            return True, entries
+    return False, entries
+
+
 async def _require_writable(pl: dict) -> YouTubeMusic:
     a = await access(pl["id"])
     if not a["writable"]:
@@ -182,7 +198,8 @@ async def remove(pid: int, item_ids: list[int], delete_files: bool) -> dict:
     still = set()
     if videos:
         sets = {v["setVideoId"] for v in videos}
-        still |= {e["videoId"] for e in await _entries_of(pl, yt, fresh=True) if e.get("setVideoId") in sets}
+        _, after = await _settled(pl, yt, lambda es: not any(e.get("setVideoId") in sets for e in es))
+        still |= {e["videoId"] for e in after if e.get("setVideoId") in sets}
     if hidden:
         still |= await _still_on_youtube_com(pl, set(hidden))
     gone = [it for it in items if it["video_id"] not in still]
@@ -491,28 +508,47 @@ async def apply_alternative(pid: int, item_id: int, cand: dict, replace: bool, d
     ytid = yt_playlist_id(pl)
     entries = await _entries_of(pl, yt, fresh=True)
     old_entry = next((e for e in entries if e.get("videoId") == old["video_id"] and e.get("setVideoId")), None)
-    already = any(e.get("videoId") == vid for e in entries)
-    new_set = None
-    if not already:
-        res = await yt._call(lambda c: c.add_playlist_items(ytid, [vid], duplicates=True))
-        if not isinstance(res, dict) or "SUCCEEDED" not in str(res.get("status")):
-            raise EditError(f"YouTube did not add the track: {str(res)[:200]}")
-        new_set = next((r.get("setVideoId") for r in res.get("playlistEditResults") or [] if r), None)
+
+    def new_entry(es: list[dict]) -> dict | None:
+        return next((e for e in es if e.get("videoId") == vid), None)
+
+    # 1. add the new track and wait until the playlist really shows it. The old track isn't touched before that,
+    # so when YouTube loses the add, nothing is lost
+    if not new_entry(entries):
+        for attempt in range(2):
+            # the second try skips duplicates: if the first add shows up late after all, it isn't added twice
+            res = await yt._call(lambda c, d=attempt == 0: c.add_playlist_items(ytid, [vid], duplicates=d))
+            if not isinstance(res, dict) or "SUCCEEDED" not in str(res.get("status")):
+                raise EditError(f"YouTube did not add the track: {str(res)[:200]}")
+            _entries.pop(ytid, None)
+            added, entries = await _settled(pl, yt, lambda es: new_entry(es) is not None)
+            if added:
+                break
+        else:
+            raise EditError("YouTube said it added the track, but it isn't in the playlist. "
+                            "The old track was left as it is, try again in a minute.")
+
+    # 2. only now move it to the old spot and remove the old one
     if replace:
-        if new_set and old_entry:
-            await yt._call(lambda c: c.edit_playlist(ytid, moveItem=(new_set, old_entry["setVideoId"])))
+        new_set = (new_entry(entries) or {}).get("setVideoId")
         if old_entry:
+            if new_set:
+                await yt._call(lambda c: c.edit_playlist(ytid, moveItem=(new_set, old_entry["setVideoId"])))
             await yt._call(lambda c: c.remove_playlist_items(
                 ytid, [{"videoId": old_entry["videoId"], "setVideoId": old_entry["setVideoId"]}]))
         else:  # a deleted or private video YouTube Music doesn't show
             await remove_by_video_id(yt, ytid, [old["video_id"]])
     _entries.pop(ytid, None)
 
-    # trust YouTube's playlist, not its "succeeded": Tubekeep only changes its own state once the edit is there
-    after = await _entries_of(pl, yt, fresh=True)
-    if not any(e.get("videoId") == vid for e in after):
-        raise EditError("YouTube said it added the track, but it isn't in the playlist. Nothing was changed.")
-    if replace and old_entry and any(e.get("setVideoId") == old_entry["setVideoId"] for e in after):
+    # 3. trust YouTube's playlist, not its "succeeded": Tubekeep only changes its own state once the edit is there
+    def finished(es: list[dict]) -> bool:
+        return new_entry(es) is not None and not (
+            replace and old_entry and any(e.get("setVideoId") == old_entry["setVideoId"] for e in es))
+
+    ok, after = await _settled(pl, yt, finished)
+    if not ok and not new_entry(after):
+        raise EditError("YouTube removed the old track but lost the new one. Click Replace again.")
+    if not ok:
         raise EditError("The new track was added, but YouTube kept the old one. Remove it from YouTube or try again.")
     # the old one was hidden on YouTube Music: only youtube.com can tell whether it's gone
     old_listed = bool(replace and not old_entry and await _still_on_youtube_com(pl, {old["video_id"]}))
