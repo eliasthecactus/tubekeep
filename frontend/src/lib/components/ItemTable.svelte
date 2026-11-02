@@ -209,10 +209,11 @@
 			const r = await post('/items/remove', { item_ids: removable.flatMap((g) => g.item_ids), delete_files: removeFiles });
 			const parts = [`Removed ${r.removed} from YouTube`];
 			if (r.playlists > 1) parts[0] += ` in ${r.playlists} playlists`;
+			if (r.still_listed) parts.push(`${r.still_listed} still listed on YouTube, ${r.still_listed === 1 ? 'it stays' : 'they stay'} in Tubekeep until a sync shows ${r.still_listed === 1 ? 'it' : 'them'} gone`);
 			if (r.deleted_files) parts.push(`${r.deleted_files} files deleted`);
 			const skipped = r.skipped.reduce((n: number, x: any) => n + x.tracks, 0);
 			if (skipped) parts.push(`${skipped} skipped (${r.skipped.map((x: any) => `${x.title}: ${x.reason}`).join('; ')})`);
-			toast(parts.join(', '), skipped ? 'error' : 'ok');
+			toast(parts.join(', '), skipped || r.still_listed ? 'error' : 'ok');
 			confirmRemove = false;
 			load();
 			onchanged?.();

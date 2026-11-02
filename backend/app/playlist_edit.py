@@ -8,7 +8,9 @@ import re
 import time
 from urllib.parse import parse_qs, urlparse
 
-from . import accounts, db
+import asyncio
+
+from . import accounts, db, proxies, ytdlp
 from .jobs import PLACEHOLDER_TITLES, item_event, manager
 from .matching import score
 from .providers.base import AuthError, ProviderError
@@ -16,6 +18,7 @@ from .providers.youtube import YouTubeMusic, _to_track
 
 ACCESS_TTL = 6 * 3600
 ENTRIES_TTL = 300
+RECHECK_DELAY = 5  # youtube.com can take a moment to show an edit made on YouTube Music
 _entries: dict[str, tuple[float, list[dict]]] = {}
 
 
@@ -174,11 +177,40 @@ async def remove(pid: int, item_ids: list[int], delete_files: bool) -> dict:
     hidden = sorted(wanted - {v["videoId"] for v in videos})
     await remove_by_video_id(yt, ytid, hidden)
     _entries.pop(ytid, None)
+
+    # trust the playlist, not YouTube's "succeeded": only tracks that are really gone count as removed
+    still = set()
+    if videos:
+        sets = {v["setVideoId"] for v in videos}
+        still |= {e["videoId"] for e in await _entries_of(pl, yt, fresh=True) if e.get("setVideoId") in sets}
+    if hidden:
+        still |= await _still_on_youtube_com(pl, set(hidden))
+    gone = [it for it in items if it["video_id"] not in still]
     # a playlist that deletes files of removed tracks would do it on the next sync anyway
     delete_files = delete_files or pl["on_removed"] == "delete"
-    deleted = sum(_mark_removed(it, delete_files) for it in items)
-    forget_removed(pid, [it["id"] for it in items])
-    return {"removed": len(wanted), "deleted_files": deleted}
+    deleted = sum(_mark_removed(it, delete_files) for it in gone)
+    forget_removed(pid, [it["id"] for it in gone])
+    return {"removed": len(gone), "still_listed": len(items) - len(gone), "deleted_files": deleted}
+
+
+async def _still_on_youtube_com(pl: dict, video_ids: set[str]) -> set[str]:
+    """Which of these videos youtube.com still lists, read the way a sync reads it (yt-dlp).
+    When the playlist can't be read, all of them count as still there: Tubekeep doesn't guess."""
+    acc = accounts.get(pl["account_id"]) if pl.get("account_id") else None
+    left = set(video_ids)
+    for attempt in range(2):
+        await asyncio.sleep(RECHECK_DELAY * (attempt + 1))
+        proxy = proxies.select(pl, acc)
+        async with accounts.cookies_file(acc) as cf:
+            data, _ = await ytdlp.run_json(
+                ytdlp.base_args(cf, proxy and proxy["url"]) + ["-J", "--flat-playlist", "--", pl["url"]], timeout=600)
+        if not data:
+            return left
+        listed = {e["id"] for e in (data.get("entries") or []) if e and e.get("id")}
+        left &= listed
+        if not left:
+            break
+    return left
 
 
 async def remove_by_video_id(yt: YouTubeMusic, ytid: str, video_ids: list[str]) -> None:
@@ -253,7 +285,7 @@ async def groups(item_ids: list[int]) -> list[dict]:
 async def remove_many(item_ids: list[int], delete_files: bool, extra_copies: bool = False) -> dict:
     """Removes tracks of several playlists from YouTube (or, with extra_copies, only their repeated entries).
     Read-only or syncing playlists are skipped and reported, not failed."""
-    out = {"removed": 0, "deleted_files": 0, "playlists": 0, "skipped": []}
+    out = {"removed": 0, "still_listed": 0, "deleted_files": 0, "playlists": 0, "skipped": []}
     for g in await groups(item_ids):
         reason = None
         if not g["writable"]:
@@ -270,7 +302,7 @@ async def remove_many(item_ids: list[int], delete_files: bool, extra_copies: boo
                 reason = str(e)
             else:
                 out["playlists"] += 1
-                for k in ("removed", "deleted_files"):
+                for k in ("removed", "still_listed", "deleted_files"):
                     out[k] += r.get(k, 0)
         if reason:
             out["skipped"].append({"playlist_id": g["playlist_id"], "title": g["title"],
@@ -482,6 +514,8 @@ async def apply_alternative(pid: int, item_id: int, cand: dict, replace: bool, d
         raise EditError("YouTube said it added the track, but it isn't in the playlist. Nothing was changed.")
     if replace and old_entry and any(e.get("setVideoId") == old_entry["setVideoId"] for e in after):
         raise EditError("The new track was added, but YouTube kept the old one. Remove it from YouTube or try again.")
+    # the old one was hidden on YouTube Music: only youtube.com can tell whether it's gone
+    old_listed = bool(replace and not old_entry and await _still_on_youtube_com(pl, {old["video_id"]}))
 
     now = db.now()
     title = cand.get("title") or None
@@ -504,10 +538,11 @@ async def apply_alternative(pid: int, item_id: int, cand: dict, replace: bool, d
     else:
         new_id = db.insert("items", {"playlist_id": pid, "video_id": vid, "position": position, "status": "pending",
                                      "first_seen_at": now, "updated_at": now})
-    deleted = _mark_removed(old, delete_file or pl["on_removed"] == "delete") if replace else False
-    if replace:
+    drop_old = replace and not old_listed
+    deleted = _mark_removed(old, delete_file or pl["on_removed"] == "delete") if drop_old else False
+    if drop_old:
         forget_removed(pid, [old["id"]])  # nothing left of it without a file
     item_event(new_id)
     if db.scalar("SELECT status FROM items WHERE id = ?", [new_id]) == "pending":
         manager.enqueue("download", pid, {"item_ids": [new_id]})
-    return {"item_id": new_id, "replaced": replace, "deleted_file": deleted}
+    return {"item_id": new_id, "replaced": replace, "old_still_listed": old_listed, "deleted_file": deleted}

@@ -22,6 +22,7 @@ class FakeYTMusic:
         self.tracks: list[dict] = []
         self.n = 0
         self.removed_by_id: list[str] = []
+        self.on_remove_by_id = None  # what youtube.com does with it: the test drops them from the yt-dlp listing
         self.catalog = [
             self.song("onemoretim1", "One More Time", "Daft Punk", 320),
             self.song("onemorelive", "One More Time (Live)", "Daft Punk", 400),
@@ -90,6 +91,8 @@ class FakeYTMusic:
         for a in body["actions"]:
             assert a["action"] == "ACTION_REMOVE_VIDEO_BY_VIDEO_ID"
             self.removed_by_id.append(a["removedVideoId"])
+        if self.on_remove_by_id:
+            self.on_remove_by_id([a["removedVideoId"] for a in body["actions"]])
         return {"status": "STATUS_SUCCEEDED"}
 
     def add_playlist_items(self, pid, ids, duplicates=False):
@@ -129,6 +132,7 @@ def client(fake_yt):
 def yt(monkeypatch):
     fake = FakeYTMusic()
     monkeypatch.setattr(YouTubeMusic, "_client", lambda self: fake)
+    monkeypatch.setattr(playlist_edit, "RECHECK_DELAY", 0)
     playlist_edit._entries.clear()
     return fake
 
@@ -186,7 +190,7 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert path.exists()
     r = client.post(f"/api/playlists/{pid}/remove", json={"item_ids": [its["dropsong001"]["id"]],
                                                            "delete_files": True}, headers=H).json()
-    assert r == {"removed": 1, "deleted_files": 1}
+    assert r == {"removed": 1, "still_listed": 0, "deleted_files": 1}
     assert [t["videoId"] for t in yt.tracks] == ["keepsong001", "unavail0002", "deadvideo01"]
     assert not path.exists()
     assert "dropsong001" not in items(client, pid)  # gone from YouTube and from disk: nothing left to show
@@ -425,14 +429,23 @@ def test_remove_videos_youtube_music_hides(client, fake_yt, yt):
     its = items(client, pid)
     assert its["privvideo01"]["status"] == "unavailable"
 
+    def drop(ids):  # youtube.com does what it was told
+        listing["entries"] = [e for e in listing["entries"] if e["id"] not in ids]
+        (fake_yt / "playlist.json").write_text(json.dumps(listing))
+
+    # YouTube answers "succeeded" but keeps listing it: Tubekeep doesn't pretend it's gone
+    r = client.post(f"/api/playlists/{pid}/remove", json={"item_ids": [its["privvideo01"]["id"]]}, headers=H).json()
+    assert r == {"removed": 0, "still_listed": 1, "deleted_files": 0}
+    assert items(client, pid)["privvideo01"]["removed_at"] is None
+
+    yt.on_remove_by_id = drop
     r = client.post(f"/api/playlists/{pid}/remove", json={"item_ids": [its["privvideo01"]["id"],
                                                                        its["deadvideo02"]["id"]]}, headers=H).json()
-    assert r == {"removed": 2, "deleted_files": 0}
-    assert sorted(yt.removed_by_id) == ["deadvideo02", "privvideo01"]
+    assert r == {"removed": 2, "still_listed": 0, "deleted_files": 0}
+    assert set(yt.removed_by_id) == {"deadvideo02", "privvideo01"}
+    assert set(items(client, pid)) == {"alivesong01"}
 
-    # YouTube removed them, so youtube.com stops listing them and the next sync keeps them out
-    listing["entries"] = ents[:1]
-    (fake_yt / "playlist.json").write_text(json.dumps(listing))
+    # and the next sync keeps them out, because YouTube really doesn't list them any more
     client.post(f"/api/playlists/{pid}/sync", headers=H)
     wait_jobs(client)
     assert set(items(client, pid)) == {"alivesong01"}

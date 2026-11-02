@@ -239,14 +239,14 @@ async def apply(item_ids: list[int], action: str, delete_files: bool = False,
     youtube: remove them from their YouTube playlists (and extra_copy_ids: only their repeated entries)
     file:    delete their files, Tubekeep ignores them so they don't download again; YouTube unchanged
     ignore:  Tubekeep ignores them, files and YouTube unchanged"""
-    out = {"removed": 0, "deleted_files": 0, "freed_bytes": 0, "ignored": 0, "playlists": 0,
+    out = {"removed": 0, "still_listed": 0, "deleted_files": 0, "freed_bytes": 0, "ignored": 0, "playlists": 0,
            "skipped": []}
     if action == "youtube":
         for ids, extra in ((item_ids, False), (extra_copy_ids or [], True)):
             if not ids:
                 continue
             r = await playlist_edit.remove_many(ids, delete_files, extra_copies=extra)
-            for k in ("removed", "deleted_files", "playlists"):
+            for k in ("removed", "still_listed", "deleted_files", "playlists"):
                 out[k] += r[k]
             out["skipped"] += r["skipped"]
         return out

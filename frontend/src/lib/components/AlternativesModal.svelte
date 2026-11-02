@@ -99,8 +99,9 @@
 		row.busy = c.video_id + (replace ? ':r' : ':a');
 		try {
 			const r = await post(`/playlists/${row.group.playlist_id}/items/${row.id}/alternative`, { candidate: c, replace, delete_file: deleteOld });
-			row.done = `${replace ? 'Replaced with' : 'Added'} "${c.title}"${r.deleted_file ? ', old file deleted' : ''}`;
-			toast(replace ? 'Replaced on YouTube' : 'Added to the YouTube playlist', 'ok');
+			row.done = `${replace ? 'Replaced with' : 'Added'} "${c.title}"${r.deleted_file ? ', old file deleted' : ''}${r.old_still_listed ? ', YouTube still lists the old one' : ''}`;
+			if (r.old_still_listed) toast('Added the new track, but YouTube still lists the old one. It stays in Tubekeep until a sync shows it gone.', 'error');
+			else toast(replace ? 'Replaced on YouTube' : 'Added to the YouTube playlist', 'ok');
 			onchanged?.();
 		} catch (e) {
 			errorToast(e);
