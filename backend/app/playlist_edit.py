@@ -164,19 +164,33 @@ async def remove(pid: int, item_ids: list[int], delete_files: bool) -> dict:
     wanted = {it["video_id"] for it in items}
     videos = [{"videoId": e["videoId"], "setVideoId": e["setVideoId"]} for e in entries
               if e.get("videoId") in wanted and e.get("setVideoId")]
+    ytid = yt_playlist_id(pl)
     if videos:
-        ytid = yt_playlist_id(pl)
         for i in range(0, len(videos), 100):
             res = await yt._call(lambda c, b=videos[i:i + 100]: c.remove_playlist_items(ytid, b))
             if isinstance(res, dict) or (isinstance(res, str) and "SUCCEEDED" not in res):
                 raise EditError(f"YouTube did not remove the tracks: {str(res)[:200]}")
-    _entries.pop(yt_playlist_id(pl), None)
+    # deleted and private videos: YouTube Music hides them, youtube.com (and so yt-dlp) still lists them
+    hidden = sorted(wanted - {v["videoId"] for v in videos})
+    await remove_by_video_id(yt, ytid, hidden)
+    _entries.pop(ytid, None)
     # a playlist that deletes files of removed tracks would do it on the next sync anyway
     delete_files = delete_files or pl["on_removed"] == "delete"
     deleted = sum(_mark_removed(it, delete_files) for it in items)
     forget_removed(pid, [it["id"] for it in items])
-    return {"removed": len(videos), "already_gone": len(items) - len({v["videoId"] for v in videos}),
-            "deleted_files": deleted}
+    return {"removed": len(wanted), "deleted_files": deleted}
+
+
+async def remove_by_video_id(yt: YouTubeMusic, ytid: str, video_ids: list[str]) -> None:
+    """Removes videos YouTube Music doesn't list (deleted, private), so there is no setVideoId for them.
+    youtube.com keeps them in the playlist and yt-dlp lists them, so without this they come back on the next sync."""
+    for i in range(0, len(video_ids), 100):
+        body = {"playlistId": ytid.removeprefix("VL"),
+                "actions": [{"action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID", "removedVideoId": v}
+                            for v in video_ids[i:i + 100]]}
+        res = await yt._call(lambda c, b=body: c._send_request("browse/edit_playlist", b))
+        if "SUCCEEDED" not in str((res or {}).get("status")):
+            raise EditError(f"YouTube did not remove the unavailable tracks: {str(res)[:200]}")
 
 
 async def remove_extra_copies(pid: int, item_ids: list[int]) -> dict:
@@ -239,7 +253,7 @@ async def groups(item_ids: list[int]) -> list[dict]:
 async def remove_many(item_ids: list[int], delete_files: bool, extra_copies: bool = False) -> dict:
     """Removes tracks of several playlists from YouTube (or, with extra_copies, only their repeated entries).
     Read-only or syncing playlists are skipped and reported, not failed."""
-    out = {"removed": 0, "already_gone": 0, "deleted_files": 0, "playlists": 0, "skipped": []}
+    out = {"removed": 0, "deleted_files": 0, "playlists": 0, "skipped": []}
     for g in await groups(item_ids):
         reason = None
         if not g["writable"]:
@@ -256,7 +270,7 @@ async def remove_many(item_ids: list[int], delete_files: bool, extra_copies: boo
                 reason = str(e)
             else:
                 out["playlists"] += 1
-                for k in ("removed", "already_gone", "deleted_files"):
+                for k in ("removed", "deleted_files"):
                     out[k] += r.get(k, 0)
         if reason:
             out["skipped"].append({"playlist_id": g["playlist_id"], "title": g["title"],
@@ -458,6 +472,8 @@ async def apply_alternative(pid: int, item_id: int, cand: dict, replace: bool, d
         if old_entry:
             await yt._call(lambda c: c.remove_playlist_items(
                 ytid, [{"videoId": old_entry["videoId"], "setVideoId": old_entry["setVideoId"]}]))
+        else:  # a deleted or private video YouTube Music doesn't show
+            await remove_by_video_id(yt, ytid, [old["video_id"]])
     _entries.pop(ytid, None)
 
     # trust YouTube's playlist, not its "succeeded": Tubekeep only changes its own state once the edit is there

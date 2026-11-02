@@ -21,6 +21,7 @@ class FakeYTMusic:
         self.owned = True
         self.tracks: list[dict] = []
         self.n = 0
+        self.removed_by_id: list[str] = []
         self.catalog = [
             self.song("onemoretim1", "One More Time", "Daft Punk", 320),
             self.song("onemorelive", "One More Time (Live)", "Daft Punk", 400),
@@ -83,6 +84,13 @@ class FakeYTMusic:
         sets = {v["setVideoId"] for v in videos}
         self.tracks = [t for t in self.tracks if t["setVideoId"] not in sets]
         return "STATUS_SUCCEEDED"
+
+    def _send_request(self, endpoint, body):
+        assert endpoint == "browse/edit_playlist"
+        for a in body["actions"]:
+            assert a["action"] == "ACTION_REMOVE_VIDEO_BY_VIDEO_ID"
+            self.removed_by_id.append(a["removedVideoId"])
+        return {"status": "STATUS_SUCCEEDED"}
 
     def add_playlist_items(self, pid, ids, duplicates=False):
         out = []
@@ -178,7 +186,7 @@ def test_remove_and_replace_on_youtube(client, fake_yt, yt):
     assert path.exists()
     r = client.post(f"/api/playlists/{pid}/remove", json={"item_ids": [its["dropsong001"]["id"]],
                                                            "delete_files": True}, headers=H).json()
-    assert r == {"removed": 1, "already_gone": 0, "deleted_files": 1}
+    assert r == {"removed": 1, "deleted_files": 1}
     assert [t["videoId"] for t in yt.tracks] == ["keepsong001", "unavail0002", "deadvideo01"]
     assert not path.exists()
     assert "dropsong001" not in items(client, pid)  # gone from YouTube and from disk: nothing left to show
@@ -397,3 +405,34 @@ def test_source_of_placeholders_and_video_titles():
 def test_special_playlists_are_read_only():
     assert playlist_edit._special("LL") and playlist_edit._special("WL") and playlist_edit._special("RDabc")
     assert playlist_edit._special("PLabc") is None
+
+
+def test_remove_videos_youtube_music_hides(client, fake_yt, yt):
+    """Deleted and private videos: yt-dlp lists them (youtube.com), YouTube Music doesn't. Removing them has to
+    reach YouTube anyway, or the next sync brings them back."""
+    ents = [{"id": "alivesong01", "title": "Alive", "channel": "Chan", "duration": 100},
+            {"id": "privvideo01", "title": "[Private video]", "channel": None, "duration": None},
+            {"id": "deadvideo02", "title": "[Deleted video]", "channel": None, "duration": None}]
+    listing = {"_type": "playlist", "id": "PLhidden", "title": "Hidden", "entries": ents}
+    (fake_yt / "playlist.json").write_text(json.dumps(listing))
+    pid = client.post("/api/playlists", json={"url": "https://www.youtube.com/playlist?list=PLhidden"},
+                      headers=H).json()["created"][0]
+    wait_jobs(client)
+    acc = db.insert("accounts", {"label": "me2", "cookies_enc": crypto.encrypt(COOKIES), "status": "valid",
+                                 "cookies_updated_at": db.now(), "created_at": db.now()})
+    client.patch(f"/api/playlists/{pid}", json={"account_id": acc}, headers=H)
+    yt.tracks = [yt.entry("alivesong01", "Alive")]  # YouTube Music shows only the playable one
+    its = items(client, pid)
+    assert its["privvideo01"]["status"] == "unavailable"
+
+    r = client.post(f"/api/playlists/{pid}/remove", json={"item_ids": [its["privvideo01"]["id"],
+                                                                       its["deadvideo02"]["id"]]}, headers=H).json()
+    assert r == {"removed": 2, "deleted_files": 0}
+    assert sorted(yt.removed_by_id) == ["deadvideo02", "privvideo01"]
+
+    # YouTube removed them, so youtube.com stops listing them and the next sync keeps them out
+    listing["entries"] = ents[:1]
+    (fake_yt / "playlist.json").write_text(json.dumps(listing))
+    client.post(f"/api/playlists/{pid}/sync", headers=H)
+    wait_jobs(client)
+    assert set(items(client, pid)) == {"alivesong01"}

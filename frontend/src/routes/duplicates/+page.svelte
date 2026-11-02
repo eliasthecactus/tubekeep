@@ -178,7 +178,6 @@
 			const parts: string[] = [];
 			if (action === 'youtube') parts.push(`Removed ${r.removed} from YouTube`);
 			else if (r.ignored) parts.push(`${r.ignored} ignored`);
-			if (r.already_gone) parts.push(`${r.already_gone} ${r.already_gone === 1 ? 'was' : 'were'} already gone`);
 			if (r.deleted_files) parts.push(`${r.deleted_files} file${r.deleted_files === 1 ? '' : 's'} deleted${r.freed_bytes ? ` (${bytes(r.freed_bytes)})` : ''}`);
 			const skipped = r.skipped.reduce((n: number, x: any) => n + x.tracks, 0);
 			if (skipped) parts.push(`${skipped} skipped (${r.skipped.map((x: any) => `${x.title}: ${x.reason}`).join('; ')})`);
