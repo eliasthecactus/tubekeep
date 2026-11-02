@@ -436,3 +436,41 @@ def test_remove_videos_youtube_music_hides(client, fake_yt, yt):
     client.post(f"/api/playlists/{pid}/sync", headers=H)
     wait_jobs(client)
     assert set(items(client, pid)) == {"alivesong01"}
+
+
+def test_files_in_folder_not_on_youtube(client, fake_yt):
+    ents = [{"id": "stayssong01", "title": "Stays", "channel": "Chan", "duration": 100},
+            {"id": "leavessong1", "title": "Leaves", "channel": "Chan", "duration": 100}]
+    listing = {"_type": "playlist", "id": "PLextra", "title": "Extras", "entries": ents}
+    (fake_yt / "playlist.json").write_text(json.dumps(listing))
+    pid = client.post("/api/playlists", json={"url": "https://www.youtube.com/playlist?list=PLextra"},
+                      headers=H).json()["created"][0]
+    wait_jobs(client)
+    its = items(client, pid)
+    folder = Path(its["stayssong01"]["file_path"]).parent
+    assert client.get(f"/api/playlists/{pid}/extra-files").json() == []
+
+    stray = folder / "Something else.mp3"
+    stray.write_bytes(b"not really audio")
+    listing["entries"] = ents[:1]  # left the playlist, the file is kept (on_removed = keep)
+    (fake_yt / "playlist.json").write_text(json.dumps(listing))
+    client.post(f"/api/playlists/{pid}/sync", headers=H)
+    wait_jobs(client)
+
+    extra = {f["name"]: f for f in client.get(f"/api/playlists/{pid}/extra-files").json()}
+    kept = Path(its["leavessong1"]["file_path"])
+    assert set(extra) == {stray.name, kept.name}
+    assert extra[kept.name]["item_id"] == its["leavessong1"]["id"] and extra[kept.name]["removed_at"]
+    assert extra[stray.name]["item_id"] is None and extra[stray.name]["title"] == "Something else"
+
+    # only listed files can be deleted
+    outside = fake_yt / "outside.mp3"
+    outside.write_bytes(b"x")
+    r = client.post(f"/api/playlists/{pid}/extra-files/delete",
+                    json={"paths": [str(stray), str(kept), str(outside), its["stayssong01"]["file_path"]]},
+                    headers=H).json()
+    assert r == {"deleted": 2}
+    assert not stray.exists() and not kept.exists() and outside.exists()
+    assert Path(its["stayssong01"]["file_path"]).exists()
+    assert set(items(client, pid)) == {"stayssong01"}
+    assert client.get(f"/api/playlists/{pid}/extra-files").json() == []

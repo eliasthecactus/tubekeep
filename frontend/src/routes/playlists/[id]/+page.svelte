@@ -7,6 +7,7 @@
 	import { errorToast, jobForPlaylist, on, toast } from '#lib/state.svelte.ts';
 	import type { Playlist } from '#lib/types.ts';
 	import ItemTable from '#lib/components/ItemTable.svelte';
+	import FolderExtras from '#lib/components/FolderExtras.svelte';
 	import JobCard from '#lib/components/JobCard.svelte';
 	import Modal from '#lib/components/Modal.svelte';
 	import PlaylistForm from '#lib/components/PlaylistForm.svelte';
@@ -24,6 +25,7 @@
 	let proxies = $state<any[]>([]);
 	let busy = $state(false);
 	let access = $state<{ writable: boolean; reason: string | null } | null>(null);
+	let extras = $state<FolderExtras>();
 
 	async function load() {
 		try {
@@ -158,7 +160,8 @@
 
 	{#if job}<JobCard {job} />{/if}
 
-	<ItemTable playlistId={id} counts={p.counts} writable={!!access?.writable} onchanged={load} />
+	<ItemTable playlistId={id} counts={p.counts} writable={!!access?.writable} onchanged={() => { load(); extras?.reload(); }} />
+	<FolderExtras playlistId={id} bind:this={extras} />
 
 	<Modal bind:open={editOpen} title="Edit playlist" width="640px">
 		<PlaylistForm bind:v={form} mode="edit" {accounts} {proxies} originalFolder={p.folder ?? ''} />

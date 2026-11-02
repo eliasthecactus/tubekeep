@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .. import auth, db, library, playlist_edit, scheduler, settings_store, storage
+from .. import auth, db, extras, library, playlist_edit, scheduler, settings_store, storage
 from ..jobs import manager
 from ..providers.base import ProviderError
 
@@ -359,6 +359,29 @@ def item_action(body: dict):
     else:
         raise HTTPException(400, "Unknown action")
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ files in the folder that aren't on YouTube
+
+def _playlist_or_404(pid: int) -> dict:
+    pl = db.row("SELECT * FROM playlists WHERE id = ?", [pid])
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    return pl
+
+
+@router.get("/playlists/{pid}/extra-files")
+def extra_files(pid: int):
+    return extras.files(_playlist_or_404(pid))
+
+
+class PathsIn(BaseModel):
+    paths: list[str]
+
+
+@router.post("/playlists/{pid}/extra-files/delete")
+def delete_extra_files(pid: int, body: PathsIn):
+    return {"deleted": extras.delete(_playlist_or_404(pid), body.paths)}
 
 
 # ------------------------------------------------------------------ changes to the YouTube playlist
